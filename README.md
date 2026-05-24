@@ -7,6 +7,25 @@ AI orchestration layer that turns plain-language requests into real files (Word,
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TB
+    User[User / AI agent] --> API[Express API]
+    API --> Orch[orchestrator.js]
+    Orch --> Parse[taskParser]
+    Parse --> Branch{task.type}
+    Branch -->|word| W[Word V2: extract → blueprint → sections → assemble]
+    Branch -->|other| P[Planned: plan → steps → execute]
+    Orch --> Skills[skills/loader]
+    Orch --> LLM[LLM client\nGemini / Groq / OpenRouter]
+    Orch --> Ex[Execify client\nmock or live]
+    Skills --> LLM
+    LLM --> Ex
+    Ex --> Val[validator]
+    Val --> DL[Download file]
+```
+
 ## What it can do today
 
 | Capability | Status | Notes |
@@ -148,24 +167,6 @@ Runtime hints for local harnesses: `docTest`, `excelTest` (e.g. use `OUTPUT_PATH
 
 ---
 
-## Architecture
-
-```mermaid
-flowchart TB
-    User[User / AI agent] --> API[Express API]
-    API --> Orch[orchestrator.js]
-    Orch --> Parse[taskParser]
-    Parse --> Branch{task.type}
-    Branch -->|word| W[Word V2: extract → blueprint → sections → assemble]
-    Branch -->|other| P[Planned: plan → steps → execute]
-    Orch --> Skills[skills/loader]
-    Orch --> LLM[LLM client\nGemini / Groq / OpenRouter]
-    Orch --> Ex[Execify client\nmock or live]
-    Skills --> LLM
-    LLM --> Ex
-    Ex --> Val[validator]
-    Val --> DL[Download file]
-```
 
 ### Word V2 pipeline (production path)
 
