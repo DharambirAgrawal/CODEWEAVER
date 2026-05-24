@@ -1,0 +1,25 @@
+{
+  "name": "codeweaver",
+  "version": "1.0.0",
+  "description": "AI orchestration layer for Execify — turns plain language into files",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node tests/run.js",
+    "test:doc": "node tests/docTest.js",
+    "test:doc:techcorp": "DOC_TEST_SCENARIO=techcorp node tests/docTest.js",
+    "test:doc:brief": "DOC_TEST_SCENARIO=product-brief node tests/docTest.js",
+    "test:excel": "node tests/excelTest.js",
+    "test:excel:sales": "EXCEL_TEST_SCENARIO=sales node tests/excelTest.js"
+  },
+  "dependencies": {
+    "docx": "^9.6.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jszip": "^3.10.1",
+    "node-fetch": "^3.3.2",
+    "uuid": "^10.0.0",
+    "xlsx": "^0.18.5"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "skills": [
+    {
+      "id": "word-node",
+      "file": "word-node.md",
+      "description": "Create .docx with Node docx package",
+      "match": {
+        "taskTypes": ["word"],
+        "languages": ["node"],
+        "libraries": ["docx"]
+      },
+      "phases": {
+        "plan": "summary",
+        "setup": "summary",
+        "codegen": "full",
+        "section": "full",
+        "assembly": "sections",
+        "retry": "full"
+      },
+      "phaseSections": {
+        "summary": [
+          "CodeWeaver execution model",
+          "Common mistakes in CodeWeaver"
+        ],
+        "sections": {
+          "assembly": [
+            "CodeWeaver execution model",
+            "Critical rules (docx-js)",
+            "Common mistakes in CodeWeaver"
+          ]
+        }
+      }
+    },
+    {
+      "id": "excel-node",
+      "file": "excel-node.md",
+      "description": "Create .xlsx with Node xlsx (SheetJS) package",
+      "match": {
+        "taskTypes": ["excel"],
+        "languages": ["node"],
+        "libraries": ["xlsx"]
+      },
+      "phases": {
+        "plan": "summary",
+        "setup": "summary",
+        "codegen": "full",
+        "retry": "full"
+      },
+      "phaseSections": {
+        "summary": [
+          "CodeWeaver execution model",
+          "Common mistakes in CodeWeaver"
+        ],
+        "sections": {
+          "assembly": [
+            "CodeWeaver execution model",
+            "Critical rules (`xlsx`)",
+            "Common mistakes in CodeWeaver"
+          ]
+        }
+      }
+    }
+  ]
+}
