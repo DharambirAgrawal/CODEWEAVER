@@ -59,6 +59,63 @@
           ]
         }
       }
+    },
+    {
+      "id": "excel-python",
+      "file": "excel-python.md",
+      "description": "Create .xlsx with Python openpyxl and pandas",
+      "match": {
+        "taskTypes": ["excel"],
+        "languages": ["python"],
+        "libraries": ["openpyxl", "pandas"]
+      },
+      "phases": {
+        "plan": "summary",
+        "setup": "summary",
+        "codegen": "full",
+        "retry": "full"
+      },
+      "phaseSections": {
+        "summary": [
+          "CodeWeaver execution model",
+          "Common mistakes in CodeWeaver"
+        ],
+        "sections": {
+          "assembly": [
+            "CodeWeaver execution model",
+            "Common mistakes in CodeWeaver",
+            "Formula patterns in openpyxl"
+          ]
+        }
+      }
+    },
+    {
+      "id": "chart-python",
+      "file": "chart-python.md",
+      "description": "Create chart images (.png/.jpg) with Python matplotlib and seaborn",
+      "match": {
+        "taskTypes": ["chart"],
+        "languages": ["python"],
+        "libraries": ["matplotlib", "seaborn"]
+      },
+      "phases": {
+        "plan": "summary",
+        "setup": "summary",
+        "codegen": "full",
+        "retry": "full"
+      },
+      "phaseSections": {
+        "summary": [
+          "CodeWeaver execution model",
+          "Common mistakes in CodeWeaver"
+        ],
+        "sections": {
+          "assembly": [
+            "CodeWeaver execution model",
+            "Common mistakes in CodeWeaver"
+          ]
+        }
+      }
     }
   ]
 }

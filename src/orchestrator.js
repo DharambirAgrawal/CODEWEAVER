@@ -11,6 +11,7 @@ const {
   buildSectionStructurePrompt,
 } = require('./llm/prompts');
 const { parseWithLLM } = require('./tasks/taskParser');
+const { refineUserPrompt } = require('./tasks/promptRefiner');
 const { parseJsonFromLlm } = require('./utils/jsonExtract');
 const execify = require('./execify/client');
 const { validateResult, formatErrorForLLM } = require('./execify/validator');
@@ -18,7 +19,7 @@ const { extractContent } = require('./content/extractor');
 const { buildBlueprint } = require('./content/blueprint');
 const { formatErrorForRetry } = require('./utils/errorClassifier');
 const { checkSectionContract, DEFAULT_DOCX_ALLOWED_CONSTRUCTORS } = require('./utils/contractChecker');
-const { TASK_TYPES } = require('./tasks/taskTypes');
+const { TASK_TYPES, resolveRuntimeTask } = require('./tasks/taskTypes');
 const logger = require('./utils/logger');
 
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '5');
@@ -113,10 +114,16 @@ async function runJob(jobId) {
   addLog(job, 'Starting job...');
 
   try {
+    // ── PHASE 0: Refine vague prompt + pick task type from skill catalog ─────
+    addLog(job, 'Clarifying your request...');
+    const refinement = await refineUserPrompt(job.message, { complete: llmComplete });
+    updateJob(job, { refinement });
+
     // ── PHASE 1: Parse task ──────────────────────────────────────────────────
     addLog(job, 'Understanding your request...');
-    const parsedTask = await parseWithLLM(job.message, { complete: llmComplete });
-    const task = resolveRuntimeTask(parsedTask);
+    const parsedTask = await parseWithLLM(job.message, { complete: llmComplete }, { refinement });
+    const execRuntime = execify.isMock === true ? 'test' : 'production';
+    const task = resolveRuntimeTask(parsedTask, execRuntime);
     updateJob(job, { task });
     addLog(job, `Task type: ${task.label} | Complexity: ${task.complexity}`);
 
@@ -215,7 +222,11 @@ async function runPlannedJob({ job, task, jobId }) {
 // ─── WORD TASK FLOW (V2) ────────────────────────────────────────────────────
 async function runWordJobV2({ job, task, jobId }) {
   addLog(job, 'Extracting document content...');
-  const content = await extractContent({ message: job.message, task, complete: llmComplete });
+  const content = await extractContent({
+    message: task.refinedMessage || job.message,
+    task,
+    complete: llmComplete,
+  });
   updateJob(job, { content });
 
   addLog(job, 'Building blueprint...');
@@ -418,20 +429,6 @@ async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-function resolveRuntimeTask(task) {
-  const taskDef = TASK_TYPES[task.type];
-  if (!taskDef) return task;
-  const isMock = execify.isMock === true;
-  const language = isMock
-    ? (taskDef.testLanguage || taskDef.language || task.language)
-    : (taskDef.productionLanguage || taskDef.language || task.language);
-  const preferredLibrary = isMock
-    ? (taskDef.testLibrary || taskDef.preferredLibrary || task.preferredLibrary)
-    : (taskDef.productionLibrary || taskDef.preferredLibrary || task.preferredLibrary);
-
-  return { ...task, language, preferredLibrary };
-}
 
 function sanitizeFunctionId(value) {
   const base = String(value || '').replace(/[^A-Za-z0-9_]/g, '_').replace(/^_+|_+$/g, '');

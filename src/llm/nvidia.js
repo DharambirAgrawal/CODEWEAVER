@@ -1,42 +1,52 @@
-// src/llm/openrouter.js
-// OpenRouter integration — OpenAI-compatible chat completions
+// src/llm/nvidia.js
+// NVIDIA NIM integration — OpenAI-compatible chat completions
 
 const logger = require('../utils/logger');
 
-const DEFAULT_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const DEFAULT_API_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
+// Keep to chat/instruct language + coding models only.
+const DEFAULT_MODELS = [
+  'qwen/qwen3-coder-480b-a35b-instruct',
+  'mistralai/mistral-large-3-675b-instruct-2512',
+  'minimaxai/minimax-m2.7',
+  'stepfun-ai/step-3.5-flash',
+  'bytedance/seed-oss-36b-instruct',
+  'mistralai/mistral-nemotron',
+  'abacusai/dracarys-llama-3.1-70b-instruct',
+  'meta/llama-4-maverick-17b-128e-instruct',
+  'upstage/solar-10.7b-instruct',
+  'nvidia/nemotron-mini-4b-instruct',
+  'google/gemma-3n-e4b-it',
+  'google/gemma-3n-e2b-it',
+  'google/gemma-2-2b-it',
+];
+
 function parseModelList() {
-  const raw = process.env.OPENROUTER_MODELS || process.env.OPENROUTER_MODEL || '';
+  const raw = process.env.NVIDIA_MODELS || '';
   const list = raw
     .split(',')
     .map(item => item.trim())
     .filter(Boolean);
 
-  return list.length ? list : ['openrouter/free'];
+  return list.length ? list : DEFAULT_MODELS;
 }
 
 function buildHeaders(apiKey) {
-  const headers = {
+  return {
     'Content-Type': 'application/json',
+    Accept: 'application/json',
     Authorization: `Bearer ${apiKey}`,
   };
-
-  const referer = process.env.OPENROUTER_APP_URL || process.env.OPENROUTER_REFERER;
-  const title = process.env.OPENROUTER_APP_NAME;
-
-  if (referer) headers['HTTP-Referer'] = referer;
-  if (title) headers['X-Title'] = title;
-
-  return headers;
 }
 
-class OpenRouterClient {
+class NvidiaClient {
   constructor(apiKey, options = {}) {
     this.apiKey = apiKey;
-    this.provider = 'openrouter';
+    this.provider = 'nvidia';
     this.modelList = options.modelList && options.modelList.length ? options.modelList : parseModelList();
-    this.baseUrl = options.baseUrl || process.env.OPENROUTER_API_URL || DEFAULT_API_URL;
+    this.baseUrl = options.baseUrl || process.env.NVIDIA_API_URL || DEFAULT_API_URL;
   }
 
   async _fetchWithFallback(messages, options) {
@@ -52,6 +62,7 @@ class OpenRouterClient {
           messages,
           max_tokens: maxTokens,
           temperature,
+          stream: false,
         };
         if (useJsonObject) {
           body.response_format = { type: 'json_object' };
@@ -65,18 +76,18 @@ class OpenRouterClient {
 
         if (!res.ok) {
           const errText = await res.text();
-          lastErr = new Error(`OpenRouter API error ${res.status}: ${errText}`);
+          lastErr = new Error(`NVIDIA API error ${res.status}: ${errText}`);
 
           if (useJsonObject && (res.status === 400 || res.status === 422)) {
             logger.warn(
-              'OpenRouter',
+              'NVIDIA',
               `Model ${model} rejected json_object mode, retrying without structured output...`,
             );
             continue;
           }
 
           if (RETRYABLE_STATUS.has(res.status)) {
-            logger.warn('OpenRouter', `Model ${model} unavailable (Status ${res.status}), trying next model...`);
+            logger.warn('NVIDIA', `Model ${model} unavailable (Status ${res.status}), trying next model...`);
             break;
           }
 
@@ -96,9 +107,9 @@ class OpenRouterClient {
     const data = await this._fetchWithFallback(messages, options);
 
     const text = data.choices?.[0]?.message?.content || '';
-    if (!text) throw new Error('OpenRouter returned empty response');
+    if (!text) throw new Error('NVIDIA returned empty response');
 
-    logger.debug('OpenRouter', `Response: ${text.length} chars`);
+    logger.debug('NVIDIA', `Response: ${text.length} chars`);
     return text.trim();
   }
 
@@ -113,4 +124,4 @@ class OpenRouterClient {
   }
 }
 
-module.exports = OpenRouterClient;
+module.exports = NvidiaClient;

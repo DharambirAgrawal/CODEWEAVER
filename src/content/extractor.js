@@ -9,7 +9,7 @@ const SECTION_TYPES = new Set(['paragraphs', 'paragraph', 'table', 'list', 'nest
 function buildContentExtractionPrompt(task, message) {
   const requirements = Array.isArray(task.requirements) && task.requirements.length
     ? task.requirements.join(', ')
-    : task.rawMessage || message;
+    : task.refinedMessage || task.rawMessage || message;
   const sectionHints = Array.isArray(task.sections) && task.sections.length
     ? `\nUser mentioned sections: ${task.sections.join(', ')}`
     : '';
@@ -144,7 +144,7 @@ function normalizeSection(section, index) {
 }
 
 function normalizeContent(raw, task) {
-  const title = String(raw?.title || task?.dataDescription || task?.rawMessage || 'Untitled Document').trim();
+  const title = String(raw?.title || task?.dataDescription || task?.refinedMessage || task?.rawMessage || 'Untitled Document').trim();
   const sections = Array.isArray(raw?.sections) ? raw.sections : [];
 
   return {
@@ -170,13 +170,13 @@ async function extractContent({ message, task, complete }) {
   } catch (err) {
     logger.warn('ContentExtractor', 'LLM content extraction failed, using fallback', err.message);
     return {
-      title: String(task?.dataDescription || task?.rawMessage || 'Untitled Document').trim(),
+      title: String(task?.dataDescription || task?.refinedMessage || task?.rawMessage || 'Untitled Document').trim(),
       sections: [
         {
           id: 'overview',
           heading: 'Overview',
           type: 'paragraphs',
-          content: [String(task?.rawMessage || message || '').trim()].filter(Boolean),
+          content: [String(task?.refinedMessage || task?.rawMessage || message || '').trim()].filter(Boolean),
         },
       ],
     };

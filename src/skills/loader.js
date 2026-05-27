@@ -194,8 +194,9 @@ function getSkillContent(entry, context = {}) {
 function buildSkillPromptBlock(context = {}) {
   if (process.env.SKILLS_ENABLED === '0') return '';
 
+  const runtime = context.runtime;
   const selected = selectSkills(context);
-  const runtimeOnly = (context.runtime === 'docTest' || context.runtime === 'excelTest') && context.phase === 'assembly';
+  const runtimeOnly = (runtime === 'docTest' || runtime === 'excelTest') && context.phase === 'assembly';
 
   if (!selected.length && !(runtime && RUNTIME_HINTS[runtime])) return '';
 
@@ -219,7 +220,6 @@ function buildSkillPromptBlock(context = {}) {
     ].join('\n');
   }
 
-  const runtime = context.runtime;
   if (runtime && RUNTIME_HINTS[runtime]) {
     block += `\n---\nRUNTIME (${runtime}):\n${RUNTIME_HINTS[runtime]}\n---\n`;
   }
@@ -238,11 +238,36 @@ function clearSkillCache() {
   _fileCache.clear();
 }
 
+/**
+ * Lightweight catalog for prompt refinement (names + descriptions only).
+ */
+function getSkillCatalog() {
+  const index = loadIndex();
+  const { TASK_TYPES } = require('../tasks/taskTypes');
+
+  const skills = (index.skills || []).map(entry => ({
+    id: entry.id || entry.file,
+    description: entry.description || entry.id || entry.file,
+    taskTypes: normalizeList(entry.match?.taskTypes),
+    languages: normalizeList(entry.match?.languages),
+    libraries: normalizeList(entry.match?.libraries),
+  }));
+
+  const taskTypes = Object.entries(TASK_TYPES).map(([type, def]) => ({
+    type,
+    label: def.label,
+    extensions: def.extensions || [def.defaultExtension].filter(Boolean),
+  }));
+
+  return { skills, taskTypes };
+}
+
 module.exports = {
   selectSkills,
   buildSkillPromptBlock,
   describeSelectedSkills,
   getSkillContent,
+  getSkillCatalog,
   clearSkillCache,
   SKILLS_DIR,
 };

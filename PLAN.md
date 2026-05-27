@@ -17,8 +17,8 @@
 | **Excel / others** | Planned pipeline: planner → per-step codegen → session execution |
 | **Skills** | `skills/*.md` + `src/skills/loader.js` → auto-injected by task/language |
 | **LLM** | Gemini, Groq, OpenRouter; `LLM_FALLBACK_PROVIDERS` + `LLM_RETRY_ATTEMPTS` |
-| **Local real tests** | `npm run test:doc`, `npm run test:excel` (Node, no Execify) |
-| **API + mock** | `npm start` + `MOCK_EXECIFY=true` (orchestration only; fake file bytes) |
+| **Local real run** | `npm test` (single prompt file, no Execify) |
+| **API server** | `npm start` (Execify required for real execution) |
 
 ---
 
@@ -29,12 +29,13 @@ CodeWeaver sits on top of Execify. It is the brain. Execify is the muscle.
 A user says: *"Make me an Excel report with regional sales, formulas, and a summary dashboard"*
 
 CodeWeaver:
-1. Understands the request (task parse + optional skill context)
-2. Plans the code structure (or Word V2 content/blueprint)
-3. Generates code in chunks with domain skills in prompts
-4. Sends each chunk to Execify to run and verify (or runs locally in test harnesses)
-5. Assembles the final file (deterministic for Word V2 + local test finals)
-6. Delivers it to the user
+1. Refines vague requests using the skill catalog (`promptRefiner.js`)
+2. Understands the request (task parse + optional skill context)
+3. Plans the code structure (or Word V2 content/blueprint)
+4. Generates code in chunks with domain skills in prompts
+5. Sends each chunk to Execify to run and verify (or runs locally in test harnesses)
+6. Assembles the final file (deterministic for Word V2 + local test finals)
+7. Delivers it to the user
 
 The user never sees code. They just get their file.
 
@@ -78,15 +79,8 @@ codeweaver/
 │   ├── word-node.md
 │   └── excel-node.md
 ├── tests/
-│   ├── docTest.js             # Real .docx — tests/output/
-│   ├── docScenarios.js
-│   ├── docSetupTemplate.js
-│   ├── docSkillAudit.js
-│   ├── excelTest.js           # Real .xlsx — tests/output/excel/
-│   ├── excelScenarios.js
-│   ├── excelSetupTemplate.js
-│   ├── run.js                 # Mock orchestrator
-│   └── mock/execifyMock.js
+│   ├── prompt.py              # Single prompt input
+│   └── runPrompt.js           # Local runner
 ├── README.md
 ├── PLAN.md
 └── .env.example
@@ -100,14 +94,17 @@ codeweaver/
 # Server
 PORT=4000
 
-# LLM Provider (gemini | groq | openrouter)
+# LLM Provider (gemini | groq | openrouter | nvidia)
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=your_gemini_key_here
 GROQ_API_KEY=your_groq_key_here
 OPENROUTER_API_KEY=your_openrouter_key_here
+NVIDIA_API_KEY=your_nvidia_key_here
 OPENROUTER_MODEL=openrouter/free
 # Optional: comma-separated fallback list (overrides OPENROUTER_MODEL)
 # OPENROUTER_MODELS=model-a,model-b,model-c
+# Optional: comma-separated NVIDIA model list
+# NVIDIA_MODELS=model-a,model-b,model-c
 # Optional OpenRouter app metadata (sent as HTTP headers)
 # OPENROUTER_APP_URL=https://your-app.example
 # OPENROUTER_REFERER=https://your-app.example
@@ -129,23 +126,15 @@ MAX_RETRIES=5
 # Skills (skills/index.json). SKILLS_ENABLED=0 to disable.
 # SKILL_MAX_CHARS=12000
 
-# Testing Mode (true = mock Execify — fake file bytes, not real spreadsheets/docs)
-MOCK_EXECIFY=true
 
-# --- Local Word test (tests/docTest.js) ---
-# DOC_TEST_SCENARIO=techcorp | product-brief
-# DOC_TEST_DETERMINISTIC_PLAN=1
-# DOC_TEST_PARALLEL_LIMIT=1
-# DOC_TEST_CODE_GEN_MAX_TOKENS=8192
-# DOC_TEST_SKILL_MAX_CHARS=4500
-
-# --- Local Excel test (tests/excelTest.js) ---
-# EXCEL_TEST_SCENARIO=sales
-# EXCEL_TEST_CODE_GEN_MAX_TOKENS=8192
-# EXCEL_TEST_SKILL_MAX_CHARS=4000
+# --- Local single-prompt runner (tests/runPrompt.js) ---
+# CW_PROMPT_FILE=tests/prompt.py
+# CW_OUTPUT_DIR=tests/output
+# CW_CODE_GEN_MAX_TOKENS=6000
+# CW_PYTHON=/path/to/python
 ```
 
-**Important:** `MOCK_EXECIFY=true` exercises the orchestrator API path only. For **real** `.docx` / `.xlsx` files, use `npm run test:doc` and `npm run test:excel` (see README.md).
+**Important:** For **real** files locally, use `npm test` (single prompt runner).
 
 ---
 
@@ -153,9 +142,33 @@ MOCK_EXECIFY=true
 
 This is the heart of the system. Every user request goes through this exact flow.
 
+### Phase 0 — Prompt refinement
+
+Before JSON task parse or planning, a lightweight LLM call receives:
+
+- The raw user message (may be short or ambiguous)
+- A catalog of registered skills (`id` + `description` + task types) from `skills/index.json`
+- Supported output types from `taskTypes.js`
+
+It returns structured JSON:
+
+```json
+{
+  "refinedPrompt": "Detailed, actionable specification for planners and codegen",
+  "taskType": "excel",
+  "complexity": "medium",
+  "outputFileName": "sales_report.xlsx",
+  "requirements": ["1000 rows", "group by region", "summary sheet"]
+}
+```
+
+Downstream steps use `refinedPrompt` as the working spec; `rawMessage` is preserved for traceability. Disable with `PROMPT_REFINE_ENABLED=0`.
+
+Implementation: `src/tasks/promptRefiner.js`, wired in `orchestrator.js` and `tests/runPrompt.js`.
+
 ### Phase 1 — Task Parsing
 
-User input is parsed into a structured task object:
+The refined prompt is parsed into a structured task object:
 
 ```json
 {
@@ -237,7 +250,7 @@ Context passed to LLM on each turn:
 |------|-------------------|
 | **Word (V2)** | Orchestrator builds the final script deterministically (`buildAssemblyScript`) — no LLM for assembly |
 | **Excel / PDF / CSV / etc.** | LLM writes final step that saves to `/workspace/<outputFile>`; sent to Execify |
-| **Local `test:doc` / `test:excel`** | Fixed templates in `docSetupTemplate.js` / `excelSetupTemplate.js` (uses `OUTPUT_PATH`, not `/workspace/`) |
+| **Local runner (`npm test`)** | Generates a single Python script and executes locally; writes to `tests/output/` |
 
 After assembly, the final script runs on Execify (or locally in test harnesses). The output file is produced.
 
@@ -289,7 +302,7 @@ Output file is returned to user as a downloadable response. Base64 from Execify 
 
 ### Structured outputs and parsing (planning is not chain-of-thought)
 
-Several steps require machine-readable JSON: task parsing (`taskParser.js`), orchestrator planning (`orchestrator.js`), and the doc integration test planner (`tests/docTest.js`). The failure you get when a model “talks inside JSON” is usually **architecture**, not model quality: the same completion was being used for both a strict data contract and loose natural language.
+Several steps require machine-readable JSON: task parsing (`taskParser.js`) and planning (`orchestrator.js`, local runner). The failure you get when a model “talks inside JSON” is usually **architecture**, not model quality: the same completion was being used for both a strict data contract and loose natural language.
 
 **How we handle it in production:**
 
@@ -299,7 +312,7 @@ Several steps require machine-readable JSON: task parsing (`taskParser.js`), orc
 
 3. **Semantic validation after parse.** For the doc test, a plan must start with a setup step and end with an assemble step, and every `functionName` must be a valid JavaScript identifier. Invalid plans are retried with an explicit “no prose inside string fields” reminder.
 
-4. **Deterministic fallback for `tests/docTest.js`.** The TechCorp Q3 scenario has a fixed list of sections (`DOC_PLAN_SECTIONS`). If the LLM still returns an unusable plan after several attempts, the harness substitutes `buildDeterministicPlan()` so local runs and CI can exercise **code generation**, retries, and assembly — the expensive part — without being blocked by a flaky free planner. Set `DOC_TEST_DETERMINISTIC_PLAN=1` to skip LLM planning entirely.
+4. **Plan fallback.** If planning JSON is invalid, the system falls back to a simple two-step plan so code generation can proceed.
 
 **Chain-of-thought vs this design:** If you want visible reasoning, use a separate user/assistant turn, a dedicated preface the parser strips, or a model feature designed for reasoning tokens. Do not ask the model to “think step by step” inside JSON field values; weak models especially will echo instructions or drift into prose mid-string, which breaks `JSON.parse` or passes garbage into downstream steps.
 
@@ -323,13 +336,14 @@ For long jobs, we keep full bodies of the last 2 steps and replace older ones wi
 
 Prompts live in `src/llm/prompts.js` and are augmented by **`buildSkillPromptBlock()`** from `src/skills/loader.js`:
 
+- **Prompt refine** — `promptRefiner.js` (+ skill catalog from `getSkillCatalog()`)
 - **Task parse** — `taskParser.js`
 - **Planner** — `buildPlannerPrompt` (+ skill summary for task type)
 - **Codegen** — `buildCodeGenPrompt`, `buildSectionPrompt` (Word V2)
 - **Retry** — `buildRetryPrompt`
 - **Validation fix** — `buildValidationFixPrompt` (wired in orchestrator for `validation_error` retries)
 
-Skills: `skills/index.json` matches `task.type`, `language`, `library`, and phase (`plan`, `codegen`, `section`, `retry`, etc.). Runtime hints for `docTest` and `excelTest` harnesses.
+Skills: `skills/index.json` matches `task.type`, `language`, `library`, and phase (`plan`, `codegen`, `section`, `retry`, etc.).
 
 ---
 
@@ -337,37 +351,22 @@ Skills: `skills/index.json` matches `task.type`, `language`, `library`, and phas
 
 | Skill | Match | Used by |
 |-------|-------|---------|
-| `word-node.md` | word + node + docx | Orchestrator (mock Node word), `test:doc` |
-| `excel-node.md` | excel + node + xlsx | Orchestrator (mock Node excel), `test:excel` |
+| `word-node.md` | word + node + docx | Orchestrator (Node docx) |
+| `excel-node.md` | excel + node + xlsx | Orchestrator (Node xlsx) |
 
-Skills document APIs, `/workspace` paths (Execify), formula patterns, and common mistakes. Local tests add harness overrides (`OUTPUT_PATH`, helper names).
+Skills document APIs, `/workspace` paths (Execify), formula patterns, and common mistakes.
 
 ---
 
-## Local test harnesses (real files, no Execify)
+## Local single-prompt runner (real files, no Execify)
 
-### Word — `tests/docTest.js`
+Use `tests/prompt.py` as the single prompt input. Run:
 
-- Scenarios: `tests/docScenarios.js` (`techcorp`, `product-brief`)
-- Fixed: `docSetupTemplate.js` (setup helpers + assemble with `OUTPUT_PATH`)
-- LLM: middle section functions only
-- Output: `tests/output/*.docx`, `final_generate.js`
-- Validates: syntax, runtime, heading structure, skill audit (`docSkillAudit.js`)
-- Commands: `npm run test:doc`, `test:doc:techcorp`, `test:doc:brief`
+```bash
+npm test
+```
 
-### Excel — `tests/excelTest.js`
-
-- Scenario: `tests/excelScenarios.js` (`sales` — 4 sheets, formulas, SUMIF, dashboard)
-- Fixed: `excelSetupTemplate.js` (`setupExcel`, `withRevenueColumn`, `withMarginPercentColumn`, assemble)
-- LLM: sheet builder functions return `{ sheetName, rows, formulas? }`
-- Output: `tests/output/excel/sales_analytics_q3.xlsx`
-- Min row counts enforced per step
-- Command: `npm run test:excel`
-
-### Mock orchestrator — `tests/run.js`
-
-- `MOCK_EXECIFY=true` always
-- Does **not** produce real files
+The runner detects the task type from the prompt, plans the steps, generates code, and executes locally using Python. Output files are written to `tests/output/`.
 
 ---
 
@@ -392,18 +391,9 @@ Execify sessions persist the workspace between calls. So step 1 writes helper fu
 
 ---
 
-## Mock Execify (Testing Without Execify)
+## Execify (production)
 
-When `MOCK_EXECIFY=true`, `execify/client.js` routes all calls to `tests/mock/execifyMock.js`.
-
-The mock:
-- Returns success for syntactically valid code (basic parentheses check)
-- Returns a fake output file only if the code mentions a /workspace/... path
-- Logs all calls so you can inspect what CodeWeaver is sending
-
-This lets you develop and test the entire orchestration loop, LLM integration, retry logic, and validation — without Execify running at all.
-
-When ready to connect real Execify: set `MOCK_EXECIFY=false` and point `EXECIFY_BASE_URL` to your instance.
+For production runs, configure `EXECIFY_BASE_URL` and `EXECIFY_API_KEY` and run through the API server (`npm start`).
 
 ---
 
@@ -467,14 +457,14 @@ data: {"jobId":"job_abc123","downloadUrl":"/download/job_abc123"}
 
 | Type | Production (Execify) | Local real test | Skill |
 |------|----------------------|-----------------|-------|
-| Excel `.xlsx` | Python `openpyxl` | Node `xlsx` (`test:excel`) | `excel-node.md` |
-| Word `.docx` | Python `python-docx` | Node `docx` (`test:doc`) | `word-node.md` |
+| Excel `.xlsx` | Python `openpyxl` | Python `openpyxl` (local runner) | `excel-python.md` or `excel-node.md` |
+| Word `.docx` | Python `python-docx` | Node `docx` (local runner) | `word-node.md` |
+| Chart | matplotlib, seaborn | Python `matplotlib`/`seaborn` (local runner) | `chart-python.md` |
 | PDF | reportlab, fpdf2 | — | — |
 | CSV | csv (stdlib) | — | — |
 | Text | stdlib | — | — |
-| Chart | matplotlib, etc. | — | — |
 
-Runtime language/library chosen in `taskTypes.js` via `resolveRuntimeTask()` (mock → testLanguage/testLibrary; live → production).
+Runtime language/library chosen in `taskTypes.js` via `resolveRuntimeTask()`: local Word → Node/`docx`; local Excel/chart → Python; production Word → Python/`python-docx` on Execify.
 
 Extend by adding task type + optional skill in `skills/index.json`.
 
@@ -488,7 +478,7 @@ Extend by adding task type + optional skill in `skills/index.json`.
 | `syntax_error` (retryable=false) | Stop early for the step and fail the job |
 | `validation_error` | Retry the step, passing the validation message as error context |
 | LLM error | `llmComplete`: retries per provider, then `LLM_FALLBACK_PROVIDERS` |
-| Plan parse error | Fallback to a simple 2-step plan (or deterministic plan in doc/excel tests) |
+| Plan parse error | Fallback to a simple 2-step plan |
 
 ---
 
@@ -496,29 +486,18 @@ Extend by adding task type + optional skill in `skills/index.json`.
 
 ### Phase 1 — Foundation ✅ DONE
 - [x] Project setup, .env, logger
-- [x] Execify mock
-- [x] Execify HTTP client (real + mock switchable)
+- [x] Execify HTTP client
 - [x] LLM client (Gemini + Groq + OpenRouter)
 - [x] Basic prompts (task parser, planner, code gen, retry, validation fix)
 - [x] Orchestrator with full chunked loop + retry
 - [x] POST /generate, GET /status, GET /stream, GET /download endpoints
 - [x] Output validator (file size, row count, type checks)
 
-### Phase 1.5 — Local real-file tests ✅ DONE
+### Phase 1.5 — Local single-prompt runner ✅ DONE
 
-**Word** (`tests/docTest.js`):
-- Scenarios: TechCorp Q3 report, product launch brief
-- Skills + fixed setup/assemble templates
-- Real `.docx` under `tests/output/`
-- See README.md for commands
-
-**Excel** (`tests/excelTest.js`):
-- Sales analytics workbook: transactions, catalog, regional SUMIF, analysis dashboard
-- Formula helpers in `excelSetupTemplate.js`
-- Real `.xlsx` under `tests/output/excel/`
-- Auto-runs `final_generate.js` on success
-
-**Why Node for local tests:** `docx` and `xlsx` npm packages; immediate `node` execution. Production Execify path still uses Python (`python-docx`, `openpyxl`) per `taskTypes.js`.
+- Single input file at `tests/prompt.py`
+- `npm test` plans, generates, and executes locally via Python
+- Outputs written to `tests/output/`
 
 ### Phase 2 — Chunked Generation
 - [x] Chunked code generation with session
@@ -533,7 +512,7 @@ Extend by adding task type + optional skill in `skills/index.json`.
 
 ### Phase 1.6 — Skills + LLM resilience ✅ DONE
 - [x] `skills/` + `src/skills/loader.js`
-- [x] `word-node.md`, `excel-node.md`, `skills/index.json`
+- [x] `word-node.md`, `excel-node.md`, `excel-python.md`, `chart-python.md`, `skills/index.json`
 - [x] Cross-provider `LLM_FALLBACK_PROVIDERS` + `LLM_RETRY_ATTEMPTS`
 - [x] `buildValidationFixPrompt` wired in orchestrator
 
@@ -541,9 +520,9 @@ Extend by adding task type + optional skill in `skills/index.json`.
 - [ ] Persist jobs (replace in-memory Map; enable real /jobs listing)
 - [ ] Local Excel runner without re-clearing output on partial failure (resume)
 - [ ] Expand validations (Excel formula verification, CSV headers)
-- [ ] More Excel/Word scenarios
+- [ ] Add richer sample prompts for the single-prompt runner
 - [ ] Simple chat UI or agent SDK integration (optional)
-- [ ] `LOCAL_EXEC` mode on server (Node/Python subprocess without Execify mock)
+- [ ] `LOCAL_EXEC` mode on server (Node/Python subprocess without Execify)
 
 ---
 
@@ -576,7 +555,7 @@ Implemented in orchestrator for `task.type === 'word'`:
 4. Deterministic assembly (`buildAssemblyScript` in orchestrator)
 5. Error classification (`errorClassifier.js`) + contract checks (`contractChecker.js`)
 6. Structural DOCX validation (`validator.js`)
-7. Production: `python-docx`; mock/test: Node + `docx`
+7. Production: `python-docx`
 
 ---
 
@@ -584,12 +563,10 @@ Implemented in orchestrator for `task.type === 'word'`:
 
 | What you want | Command | Notes |
 |---------------|---------|--------|
-| Real Word `.docx` | `npm run test:doc` | `tests/output/` — scenarios `techcorp`, `product-brief` |
-| Real Excel `.xlsx` | `npm run test:excel` | `tests/output/excel/sales_analytics_q3.xlsx` |
-| Orchestrator smoke test | `npm test` | Mock Execify; no real files |
-| HTTP API | `npm start` | `MOCK_EXECIFY=true` → fake download bytes |
+| Single prompt local runner | `npm test` | Reads `tests/prompt.py`, writes to `tests/output/` |
+| HTTP API | `npm start` | Execify required for real execution |
 
-Recommended: `LLM_PROVIDER=gemini` for local tests (Groq free tier often 429/413 on large prompts).
+Recommended: `LLM_PROVIDER=gemini` for local runs (Groq free tier often 429/413 on large prompts).
 
 Full tables and env vars: [README.md](./README.md).
 
@@ -598,4 +575,4 @@ Full tables and env vars: [README.md](./README.md).
 ## History (Short)
 
 - 2026-05-13: Word V2 foundation in orchestrator.
-- 2026-05-24: Skills system; doc/excel local test harnesses; LLM cross-provider fallback; README/PLAN refresh.
+- 2026-05-24: Skills system; single prompt local runner; LLM cross-provider fallback; README/PLAN refresh.

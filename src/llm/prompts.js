@@ -37,8 +37,8 @@ TASK:
 - Language: ${task.language}
 - Preferred library: ${task.preferredLibrary}
 - Complexity: ${task.complexity}
-- Requirements: ${task.requirements.join(', ') || task.rawMessage}
-- Data description: ${task.dataDescription || task.rawMessage}
+- Requirements: ${task.requirements.join(', ') || task.refinedMessage || task.rawMessage}
+- Data description: ${task.dataDescription || task.refinedMessage || task.rawMessage}
 ${task.estimatedRows ? `- Estimated rows: ${task.estimatedRows}` : ''}
 ${task.estimatedPages ? `- Estimated pages: ${task.estimatedPages}` : ''}
 ${task.sheets ? `- Sheets: ${task.sheets.join(', ')}` : ''}
@@ -46,12 +46,21 @@ ${task.sections ? `- Sections: ${task.sections.join(', ')}` : ''}
 
 AVAILABLE LIBRARIES: ${libs.join(', ')}
 
-Break this into ${task.estimatedChunks} to ${task.estimatedChunks + 2} steps. Each step must be ONE Python function.
+${task.language === 'node' && task.type === 'word'
+    ? `Plan exactly ${task.estimatedChunks} to ${task.estimatedChunks + 2} steps:
+1. One setup step: plain JavaScript config/constants only (NO require(), NO docx constructors)
+2. Content steps: each returns an array of docx block elements for one document section
+Do NOT add a final assembly, save, pack, or write-file step — the runner assembles the .docx automatically.`
+    : `Break this into ${task.estimatedChunks} to ${task.estimatedChunks + 2} steps. Each step must be ONE ${task.language === 'node' ? 'JavaScript' : 'Python'} function.`}
 
 Rules:
 - Each step is a single function, independently testable
-- Step 1 MUST set up imports and define constants/config
-- The LAST step MUST call all previous functions and save final file to /workspace/${task.outputFile}
+${task.language === 'node' && task.type === 'word'
+    ? `- Step 1 (setup): return a plain config object only — strings, numbers, nested data; no Paragraph/Table/Document
+- Content steps: function returns an array of docx elements; no require(), Document(), Packer, or fs
+- Do NOT include a step that saves or assembles the file`
+    : `- Step 1 MUST set up imports and define constants/config
+- The LAST step MUST call all previous functions and save final file to /workspace/${task.outputFile}`}
 - Steps should be small enough that a good developer could write each in under 150 lines
 - Use ONLY libraries from the available list above
 - No step should depend on anything not produced by a previous step
@@ -92,12 +101,14 @@ function buildCodeGenPrompt(task, plan, currentStep, verifiedFunctions, lastErro
     ? `\nPREVIOUS ATTEMPT FAILED WITH THIS ERROR:\n${lastError}\nFix the issue in your new attempt.\n`
     : '';
 
-  const skillPhase = isLastStep ? 'assembly' : 'codegen';
+  const nodeWord = task.language === 'node' && task.type === 'word';
+  const isSetup = nodeWord && /setup|imports|constants|config/i.test(`${currentStep.name} ${currentStep.functionName}`);
+  const skillPhase = nodeWord ? (isSetup ? 'setup' : 'codegen') : (isLastStep ? 'assembly' : 'codegen');
   const skills = skillBlockForTask(task, skillPhase);
 
   return `You are an expert ${task.language} developer generating code for a file generation system.
 ${skills}
-TASK: Generate a ${task.label} — ${task.dataDescription || task.rawMessage}
+TASK: Generate a ${task.label} — ${task.dataDescription || task.refinedMessage || task.rawMessage}
 OUTPUT FILE: /workspace/${task.outputFile}
 AVAILABLE LIBRARIES: ${libs.join(', ')}
 ${functionsContext}
@@ -111,20 +122,28 @@ Depends on: ${currentStep.dependsOn.length ? currentStep.dependsOn.map(d => {
     return dep ? `${dep.functionName}()` : `step ${d}`;
   }).join(', ') : 'nothing'}
 
-${isLastStep ? `CRITICAL: This is the FINAL step. You MUST:
+${nodeWord && isSetup ? `This is the SETUP step. Return a plain configuration object only.
+- NO require(), import, Document, Packer, Paragraph, Table, or fs
+- Use plain strings/numbers/arrays for titles, labels, and sample data other steps may read via ${currentStep.functionName}()
+- Do NOT return docxConstructors and do NOT add constructor maps in setup output
+` : nodeWord ? `This is a CONTENT section step for docx.
+- Return an array of block elements: [ new Paragraph(...), new Table(...), ... ]
+- NO require(), Document(), Packer, or fs — imports are provided by the runner
+- You may call ${verifiedFunctions.map(f => f.functionName + '()').join(', ') || 'setup()'} for shared config
+- Never read setup().docxConstructors; use Paragraph/TextRun/Table directly
+` : isLastStep ? `CRITICAL: This is the FINAL step. You MUST:
 1. Call all previous verified functions
 2. Assemble the complete output
 3. Save the final file to /workspace/${task.outputFile}
-4. Print "SUCCESS: file saved to /workspace/${task.outputFile}" as the last line
+4. Print "SUCCESS: saved /workspace/${task.outputFile}" as the last line
 ` : `This is NOT the final step. Do NOT save the final file yet.
 Return the data/object as specified in "Returns" above.
 `}
 
 Rules:
-- Write ONLY the function, plus any necessary imports at the top
+- Write ONLY one function named ${currentStep.functionName} — no require/import lines${nodeWord ? ' (runner hoists docx imports)' : ', plus imports at the top if needed'}
 - Implement ONLY this step. Do NOT generate code for any other step or section
-- Define exactly one top-level function named ${currentStep.functionName}
-- Do NOT include a main() block or if __name__ == '__main__'
+- Do NOT include a main() block, module.exports, or if __name__ == '__main__'
 - The function must be callable with no required arguments (use defaults)
 - If generating data (rows, paragraphs, etc), use realistic-looking sample data, not placeholders
 - Do NOT assume helpers beyond the verified signatures listed above

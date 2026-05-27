@@ -7,11 +7,11 @@ const TASK_TYPES = {
     extensions: ['.xlsx', '.xls'],
     defaultExtension: '.xlsx',
     language: 'python',
-    testLanguage: 'node',
+    testLanguage: 'python',
     productionLanguage: 'python',
     libraries: ['openpyxl', 'pandas', 'xlsxwriter', 'xlsx'],
     preferredLibrary: 'openpyxl',
-    testLibrary: 'xlsx',
+    testLibrary: 'openpyxl',
     productionLibrary: 'openpyxl',
     validation: {
       minSizeBytes: 1000,
@@ -131,4 +131,30 @@ function estimateChunks(complexity) {
   return { low: 2, medium: 3, high: 5 }[complexity] || 3;
 }
 
-module.exports = { TASK_TYPES, detectTaskType, estimateComplexity, estimateChunks };
+/**
+ * Pick language/library for the execution environment.
+ * @param {object} task - parsed task
+ * @param {'production'|'local'|'test'} runtime
+ */
+function resolveRuntimeTask(task, runtime = 'production') {
+  const taskDef = TASK_TYPES[task.type];
+  if (!taskDef) return task;
+
+  const useTestRuntime = runtime === 'local' || runtime === 'test';
+  const language = useTestRuntime
+    ? (taskDef.testLanguage || taskDef.language || task.language)
+    : (taskDef.productionLanguage || taskDef.language || task.language);
+  const preferredLibrary = useTestRuntime
+    ? (taskDef.testLibrary || taskDef.preferredLibrary || task.preferredLibrary)
+    : (taskDef.productionLibrary || taskDef.preferredLibrary || task.preferredLibrary);
+
+  return { ...task, language, preferredLibrary };
+}
+
+module.exports = {
+  TASK_TYPES,
+  detectTaskType,
+  estimateComplexity,
+  estimateChunks,
+  resolveRuntimeTask,
+};

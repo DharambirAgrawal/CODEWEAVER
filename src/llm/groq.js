@@ -20,27 +20,38 @@ function groqSuggestedRetryMs(errBody) {
 }
 
 // Models ordered by preference — falls through on 429/503
-// TPD limits (free tier): 70b=100K, 8b=500K, llama-4-scout=500K
+// Prioritize higher quality, then broader availability/capacity.
 const FALLBACK_MODELS = [
+  'openai/gpt-oss-120b',
+  'qwen/qwen3-32b',
   'llama-3.3-70b-versatile',
-  'llama-3.1-8b-instant',
   'meta-llama/llama-4-scout-17b-16e-instruct',
+  'openai/gpt-oss-20b',
+  'llama-3.1-8b-instant',
 ];
 
 class GroqClient {
   constructor(apiKey) {
     this.apiKey = apiKey;
     this.provider = 'groq';
+    this.modelList = FALLBACK_MODELS.slice();
   }
 
   async _fetchWithFallback(messages, options) {
-    const { maxTokens = 4096, temperature = 0.2, jsonObject = false } = options;
+    const {
+      maxTokens = 4096,
+      temperature = 0.2,
+      jsonObject = false,
+      model: forcedModel = null,
+      rateLimitRetries = GROQ_RATE_LIMIT_RETRIES,
+    } = options;
     let lastErr = null;
     const jsonAttempts = jsonObject ? [true, false] : [false];
+    const models = forcedModel ? [forcedModel] : FALLBACK_MODELS;
 
-    for (const model of FALLBACK_MODELS) {
+    for (const model of models) {
       jsonAttempts: for (const useJsonObject of jsonAttempts) {
-        for (let rateAttempt = 0; rateAttempt < GROQ_RATE_LIMIT_RETRIES; rateAttempt++) {
+        for (let rateAttempt = 0; rateAttempt < rateLimitRetries; rateAttempt++) {
           const body = {
             model,
             messages,
@@ -74,11 +85,11 @@ class GroqClient {
           }
 
           if (res.status === 429 || res.status === 503) {
-            if (rateAttempt < GROQ_RATE_LIMIT_RETRIES - 1) {
+            if (rateAttempt < rateLimitRetries - 1) {
               const wait = groqSuggestedRetryMs(errText) ?? Math.min(30_000, 2000 * (rateAttempt + 1));
               logger.warn(
                 'Groq',
-                `Model ${model} rate-limited (${res.status}), waiting ${wait}ms then retry ${rateAttempt + 1}/${GROQ_RATE_LIMIT_RETRIES - 1}...`,
+                `Model ${model} rate-limited (${res.status}), waiting ${wait}ms then retry ${rateAttempt + 1}/${rateLimitRetries - 1}...`,
               );
               await sleep(wait);
               continue;
