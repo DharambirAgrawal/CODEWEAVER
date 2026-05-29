@@ -13,9 +13,8 @@ AI orchestration layer that turns plain-language requests into real files (Word,
 flowchart TB
     User[User / AI agent] --> API[Express API]
     API --> Orch[orchestrator.js]
-    Orch --> Refine[promptRefiner]
-    Refine --> Parse[taskParser]
-    Parse --> Branch{task.type}
+    Orch --> Analyze[taskAnalyzer / analyzeTask]
+    Analyze --> Branch{task.type}
     Branch -->|word| W[Word V2: extract → blueprint → sections → assemble]
     Branch -->|other| P[Planned: plan → steps → execute]
     Orch --> Skills[skills/loader]
@@ -31,14 +30,13 @@ flowchart TB
 
 | Capability | Status | Notes |
 |------------|--------|--------|
-| Refine vague prompts (skill catalog) | ✅ | `promptRefiner.js` → detailed spec + task type hint |
-| Parse natural-language requests | ✅ | `taskParser.js` → type, complexity, output file |
+| Refine + parse vague prompts | ✅ | `taskAnalyzer.js` / `analyzeTask()` → refined spec + task type + output file |
 | Multi-step plan + chunked codegen | ✅ | Excel, PDF, CSV, text, chart via planned pipeline |
 | Word documents (V2) | ✅ | Extract → blueprint → per-section codegen → deterministic assembly |
 | Domain **skills** injected into prompts | ✅ | `skills/word-node.md`, `skills/excel-node.md`, `skills/excel-python.md`, `skills/chart-python.md` |
 | LLM providers | ✅ | Gemini, Groq, OpenRouter, NVIDIA + cross-provider fallback |
 | API server (`POST /generate`, SSE, download) | ✅ | `npm start` |
-| **Single prompt local run** | ✅ | `npm test` → generates a real `.docx`, `.xlsx`, `.png`, or `.csv` based on prompt |
+| **Single prompt local run** | ✅ | `npm test` → runs `tests/runPrompt.js` against `tests/prompt.js` and writes to `tests/output/` |
 | Live Execify production | 🔧 | Set Execify URL + API key |
 
 ### Supported output types
@@ -48,7 +46,6 @@ flowchart TB
 | Word `.docx` | Python + `python-docx` | Node + `docx` (`word-node` skill) via `npm test` |
 | Excel `.xlsx` | Python + `openpyxl` | Local runner (`npm test`) |
 | Chart `.png` / `.jpg` | Python + `matplotlib`/`seaborn` | Local runner (`npm test`) |
-| PDF, CSV, text | Python libraries | Via API + mock only today |
 
 ---
 
@@ -87,7 +84,7 @@ LLM_PARALLEL_SCOPE=all
 
 ### 3. Run a single prompt locally (no Execify required)
 
-1) Edit the prompt in [tests/prompt.py](tests/prompt.py) (paste ONE prompt into `PROMPT`)
+1) Edit the prompt in [tests/prompt.js](tests/prompt.js) (paste ONE prompt into `PROMPT`)
 
 2) Run:
 
@@ -96,6 +93,7 @@ npm test
 ```
 
 Output files are written to [tests/output](tests/output).
+Use `CLEAN_PROBE=0` when you want to keep probe files in [tests/output](tests/output) for debugging.
 
 Word runs use Node (`docx` from `npm install`). Excel/chart runs need Python packages in `venv` (e.g. `openpyxl`, `matplotlib`).
 
@@ -105,7 +103,7 @@ Word runs use Node (`docx` from `npm install`). Excel/chart runs need Python pac
 
 | Command | What it does | Output |
 |---------|--------------|--------|
-| `npm test` | Reads [tests/prompt.py](tests/prompt.py), auto-detects type, generates + executes locally | Files in [tests/output](tests/output) |
+| `npm test` | Reads [tests/prompt.js](tests/prompt.js), auto-detects type, generates + executes locally | Files in [tests/output](tests/output) |
 
 ---
 
@@ -120,10 +118,10 @@ codeweaver/
 │   ├── llm/                   # client, gemini, groq, openrouter, nvidia, prompts.js
 │   ├── execify/               # client + validator
 │   ├── content/               # Word V2 extract + blueprint
-│   └── tasks/                 # taskTypes, taskParser
+│   └── tasks/                 # taskAnalyzer, taskParser, taskTypes
 ├── skills/                    # Domain knowledge for prompts
 ├── tests/
-│   ├── prompt.py              # Single prompt input
+│   ├── prompt.js              # Single prompt input
 │   └── runPrompt.js           # Local runner
 ├── .env.example
 ├── README.md                  # This file — start here
@@ -155,10 +153,11 @@ See `.env.example`. Most important:
 | `LLM_RETRY_ATTEMPTS` | Retries per provider (default 3) |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` / `NVIDIA_API_KEY` | At least one required |
 | `MAX_RETRIES` | Per-step codegen retries in local runner |
-| `CW_PROMPT_FILE` | Override prompt file path (default: [tests/prompt.py](tests/prompt.py)) |
+| `CW_PROMPT_FILE` | Override prompt file path (default: [tests/prompt.js](tests/prompt.js)) |
 | `CW_OUTPUT_DIR` | Output folder for local runner (default: [tests/output](tests/output)) |
 | `CW_CODE_GEN_MAX_TOKENS` | Codegen token cap for local runner |
 | `CW_PYTHON` | Python executable path for local runner |
+| `CLEAN_PROBE` | Set to `0` to keep Python probe files in [tests/output](tests/output) |
 
 ---
 

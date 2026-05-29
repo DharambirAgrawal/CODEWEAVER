@@ -199,6 +199,7 @@ function cleanCode(raw) {
 
 function normalizeOutputPaths(code, outputPath) {
   const outputFileName = path.basename(outputPath);
+  const escapedOutputFileName = outputFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const nodeOutput = `path.join(__dirname, ${JSON.stringify(outputFileName)})`;
   const pyOutput = `os.path.join(os.path.dirname(os.path.abspath(__file__)), ${JSON.stringify(outputFileName)})`;
   let result = code;
@@ -214,6 +215,28 @@ function normalizeOutputPaths(code, outputPath) {
   result = result.replace(
     /OUTPUT_PATH = ['"][^'"]+['"]/,
     `OUTPUT_PATH = ${pyOutput}`,
+  );
+  // Replace os.environ.get('OUTPUT_PATH', '/workspace/...') or os.getenv defaults
+  result = result.replace(
+    /os\.environ\.get\(\s*['"]OUTPUT_PATH['"]\s*,\s*['"][^'"']+['"]\s*\)/g,
+    'os.environ.get("OUTPUT_PATH", OUTPUT_PATH)',
+  );
+  result = result.replace(
+    /os\.getenv\(\s*['"]OUTPUT_PATH['"]\s*,\s*['"][^'"']+['"]\s*\)/g,
+    'os.getenv("OUTPUT_PATH", OUTPUT_PATH)',
+  );
+  result = result.replace(/OUTPUT_PATH\s*=\s*setup\(\)\s*\[\s*['"]OUTPUT_PATH['"]\s*\]/g, 'OUTPUT_PATH = OUTPUT_PATH');
+  result = result.replace(/setup\(\)\s*\[\s*['"]OUTPUT_PATH['"]\s*\]/g, 'OUTPUT_PATH');
+  result = result.replace(/setup\(\)\.get\(\s*['"]OUTPUT_PATH['"]\s*\)/g, 'OUTPUT_PATH');
+  result = result.replace(/setup\(\)\.get\(\s*['"]OUTPUT_PATH['"]\s*,\s*[^\)]*\)/g, 'OUTPUT_PATH');
+  result = result.replace(/['"]\/workspace\/[^'"]+['"]/g, 'OUTPUT_PATH');
+  result = result.replace(
+    new RegExp(`(filepath|output_path|output_file|save_path)\\s*=\\s*['"]${escapedOutputFileName}['"]`, 'gi'),
+    '$1 = OUTPUT_PATH',
+  );
+  result = result.replace(
+    new RegExp(`save\\(\\s*['"]${escapedOutputFileName}['"]\\s*\\)`, 'gi'),
+    'save(OUTPUT_PATH)',
   );
   return result;
 }
@@ -234,7 +257,7 @@ function validateStepSyntax(code, step, language) {
   }
 }
 
-function validateSemantics(code, step, task) {
+function validateSemantics(code, step, task, plan) {
   const errors = [];
   const isNodeWord = usesNodeDocxAssembly(task);
   const isSetup = /^setup$|^setup_/i.test(step.functionName || step.name);
@@ -302,6 +325,35 @@ function validateSemantics(code, step, task) {
         'Invalid openpyxl import: use "from openpyxl.styles.numbers import FORMAT_CURRENCY_USD_SIMPLE" ' +
         'or use explicit number formats as strings (e.g., "$#,##0.00").',
       );
+    }
+
+    // Ensure steps do not reference missing keys from setup(). If generated
+    // code accesses config['key'] or setup().get('key'), require that the
+    // plan's setup content_spec includes that key. This prevents LLMs from
+    // assuming undocumented keys without hardcoding defaults in the probe.
+    try {
+      const setupStep = (plan && Array.isArray(plan.steps))
+        ? plan.steps.find(s => (s.functionName || s.function_name) === 'setup')
+        : null;
+      const setupSpec = setupStep && (setupStep.contentSpec || setupStep.content_spec);
+      const setupText = setupSpec ? JSON.stringify(setupSpec) : '';
+      const keyPattern = /(?:setup\(\)\s*\[\s*['"]([^'"]+)['"]\s*\])|(?:setup\(\)\.get\(\s*['"]([^'"]+)['"]\s*\))|(?:config\[\s*['"]([^'"]+)['"]\s*\])|(?:config\.get\(\s*['"]([^'"]+)['"]\s*\))/g;
+      const missingKeys = new Set();
+      let m;
+      while ((m = keyPattern.exec(code)) !== null) {
+        const key = m[1] || m[2] || m[3] || m[4];
+        if (key && setupText && !setupText.includes(key)) {
+          missingKeys.add(key);
+        }
+      }
+      if (missingKeys.size) {
+        errors.push(
+          `Step "${step.name}" references setup keys not declared in the plan's setup content_spec: ${Array.from(missingKeys).join(', ')}. ` +
+          'Add these keys to `setup()` or avoid referencing undocumented keys.'
+        );
+      }
+    } catch (e) {
+      // Non-fatal — best-effort check only
     }
   }
 
@@ -406,7 +458,7 @@ ${code}
 /**
  * Runtime probe for Python steps via subprocess.
  */
-async function validatePythonRuntime(code, step, task, verifiedFunctions) {
+async function validatePythonRuntime(code, step, task, verifiedFunctions, outputPath) {
   if (task.language !== 'python') return null;
 
   const functionName = step.function_name || step.functionName;
@@ -417,10 +469,19 @@ async function validatePythonRuntime(code, step, task, verifiedFunctions) {
     .filter(Boolean)
     .join('\n\n');
 
+  const normalizedCode = outputPath ? normalizeOutputPaths(code, outputPath) : code;
+
   const probeScript = `
-import sys, os
+import sys, os, pathlib
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment, Protection
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.utils import get_column_letter
+OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ${JSON.stringify(path.basename(outputPath || path.join(OUTPUT_DIR, 'output.xlsx')))} )
 ${priorCode}
-${code}
+${normalizedCode}
 try:
     result = ${functionName}()
     print("PROBE_OK")
@@ -433,18 +494,29 @@ except Exception as e:
   try {
     fs.writeFileSync(tmpFile, probeScript);
     const pythonExe = pickPython();
-    execSync(`${pythonExe} "${tmpFile}"`, { stdio: 'pipe', timeout: 10000 });
+    execSync(`${pythonExe} "${tmpFile}"`, {
+      stdio: 'pipe',
+      timeout: 10000,
+      cwd: OUTPUT_DIR,
+      env: { ...process.env, OUTPUT_PATH: path.basename(outputPath || path.join(OUTPUT_DIR, 'output.xlsx')) },
+    });
     return null;
   } catch (err) {
     const stderr = err.stderr ? err.stderr.toString().trim() : (err.message || String(err));
     const lastLines = stderr.split('\n').slice(-3).join(' ');
-    return `Runtime probe failed for step "${step.name}": ${lastLines}`;
+    return `Runtime probe failed for step "${step.name}": ${lastLines} (probe saved: ${tmpFile})`;
   } finally {
-    try { fs.unlinkSync(tmpFile); } catch {}
+    try {
+      if (process.env.CLEAN_PROBE === '0') {
+        // Keep probe file for debugging
+      } else {
+        fs.unlinkSync(tmpFile);
+      }
+    } catch {}
   }
 }
 
-async function generateStepCode(task, plan, step, verifiedFunctions) {
+async function generateStepCode(task, plan, step, verifiedFunctions, outputPath) {
   let lastError = null;
   const parallelEnabled = shouldUseParallelForStep(task);
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -479,7 +551,7 @@ async function generateStepCode(task, plan, step, verifiedFunctions) {
         logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: syntax error`);
         continue;
       }
-      const semanticError = validateSemantics(code, step, task);
+      const semanticError = validateSemantics(code, step, task, plan);
       if (semanticError) {
         lastError = semanticError;
         logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${semanticError}`);
@@ -488,7 +560,7 @@ async function generateStepCode(task, plan, step, verifiedFunctions) {
       // Runtime probe — actually execute the function to catch API misuse
       const runtimeError = task.language === 'node'
         ? await validateNodeRuntime(code, step, task, verifiedFunctions)
-        : await validatePythonRuntime(code, step, task, verifiedFunctions);
+        : await validatePythonRuntime(code, step, task, verifiedFunctions, outputPath);
       if (runtimeError) {
         lastError = runtimeError;
         logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${runtimeError}`);
@@ -507,6 +579,13 @@ function buildPythonScript(plan, stepCodes, outputPath) {
   const outputFileName = path.basename(outputPath);
   const lines = [
     'import os',
+    'import pathlib',
+    'from datetime import date, datetime, timedelta',
+    'from pathlib import Path',
+    'from openpyxl import Workbook, load_workbook',
+    'from openpyxl.styles import Font, PatternFill, Border, Side, Alignment, Protection',
+    'from openpyxl.chart import BarChart, LineChart, PieChart, Reference',
+    'from openpyxl.utils import get_column_letter',
     `OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ${JSON.stringify(outputFileName)})`,
     '',
     ...stepCodes,
@@ -632,7 +711,7 @@ async function main() {
     const step = codegenSteps[i];
     const stepStart = Date.now();
     console.log(`Generating step ${i + 1}/${codegenSteps.length}: ${step.name}`);
-    const code = await generateStepCode(task, plan, step, verified);
+    const code = await generateStepCode(task, plan, step, verified, outputPath);
     stepCodes.push(code);
     verified.push({
       functionName: step.functionName,
@@ -670,7 +749,11 @@ async function main() {
     execSync(`node "${scriptPath}"`, { stdio: 'inherit', cwd: REPO_ROOT });
   } else {
     const pythonExe = pickPython();
-    execSync(`${pythonExe} "${scriptPath}"`, { stdio: 'inherit' });
+    execSync(`${pythonExe} "${scriptPath}"`, {
+      stdio: 'inherit',
+      cwd: OUTPUT_DIR,
+      env: { ...process.env, OUTPUT_PATH: path.basename(outputPath) },
+    });
   }
 
   validateOutput(task.type, outputPath);

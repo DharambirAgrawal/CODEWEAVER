@@ -17,7 +17,7 @@
 | **Excel / others** | Planned pipeline: planner → per-step codegen → session execution |
 | **Skills** | `skills/*.md` + `src/skills/loader.js` → auto-injected by task/language |
 | **LLM** | Gemini, Groq, OpenRouter; `LLM_FALLBACK_PROVIDERS` + `LLM_RETRY_ATTEMPTS` |
-| **Local real run** | `npm test` (single prompt file, no Execify) |
+| **Local real run** | `npm test` (`tests/runPrompt.js` + `tests/prompt.js`, no Execify) |
 | **API server** | `npm start` (Execify required for real execution) |
 
 ---
@@ -29,13 +29,12 @@ CodeWeaver sits on top of Execify. It is the brain. Execify is the muscle.
 A user says: *"Make me an Excel report with regional sales, formulas, and a summary dashboard"*
 
 CodeWeaver:
-1. Refines vague requests using the skill catalog (`promptRefiner.js`)
-2. Understands the request (task parse + optional skill context)
-3. Plans the code structure (or Word V2 content/blueprint)
-4. Generates code in chunks with domain skills in prompts
-5. Sends each chunk to Execify to run and verify (or runs locally in test harnesses)
-6. Assembles the final file (deterministic for Word V2 + local test finals)
-7. Delivers it to the user
+1. Understands the request with unified task analysis (`taskAnalyzer.js` / `analyzeTask()`)
+2. Plans the code structure (or Word V2 content/blueprint)
+3. Generates code in chunks with domain skills in prompts
+4. Sends each chunk to Execify to run and verify (or runs locally in test harnesses)
+5. Assembles the final file (deterministic for Word V2 + local test finals)
+6. Delivers it to the user
 
 The user never sees code. They just get their file.
 
@@ -72,14 +71,14 @@ codeweaver/
 │   ├── llm/                   # client, gemini, groq, openrouter, prompts.js
 │   ├── execify/               # client, validator
 │   ├── content/               # Word V2: extractor.js, blueprint.js
-│   ├── tasks/                 # taskParser.js, taskTypes.js
+│   ├── tasks/                 # taskAnalyzer.js, taskParser.js, taskTypes.js
 │   └── utils/                 # logger, jsonExtract, contractChecker, errorClassifier
 ├── skills/
 │   ├── index.json
 │   ├── word-node.md
 │   └── excel-node.md
 ├── tests/
-│   ├── prompt.py              # Single prompt input
+│   ├── prompt.js              # Single prompt input
 │   └── runPrompt.js           # Local runner
 ├── README.md
 ├── PLAN.md
@@ -128,7 +127,7 @@ MAX_RETRIES=5
 
 
 # --- Local single-prompt runner (tests/runPrompt.js) ---
-# CW_PROMPT_FILE=tests/prompt.py
+# CW_PROMPT_FILE=tests/prompt.js
 # CW_OUTPUT_DIR=tests/output
 # CW_CODE_GEN_MAX_TOKENS=6000
 # CW_PYTHON=/path/to/python
@@ -142,9 +141,9 @@ MAX_RETRIES=5
 
 This is the heart of the system. Every user request goes through this exact flow.
 
-### Phase 0 — Prompt refinement
+### Phase 0 — Unified task analysis
 
-Before JSON task parse or planning, a lightweight LLM call receives:
+Before planning, a lightweight LLM call receives:
 
 - The raw user message (may be short or ambiguous)
 - A catalog of registered skills (`id` + `description` + task types) from `skills/index.json`
@@ -162,13 +161,13 @@ It returns structured JSON:
 }
 ```
 
-Downstream steps use `refinedPrompt` as the working spec; `rawMessage` is preserved for traceability. Disable with `PROMPT_REFINE_ENABLED=0`.
+Downstream steps use `refinedPrompt` as the working spec; `rawMessage` is preserved for traceability.
 
-Implementation: `src/tasks/promptRefiner.js`, wired in `orchestrator.js` and `tests/runPrompt.js`.
+Implementation: `src/tasks/taskAnalyzer.js`, wired in `orchestrator.js` and `tests/runPrompt.js`.
 
-### Phase 1 — Task Parsing
+### Phase 1 — Planning
 
-The refined prompt is parsed into a structured task object:
+The analyzed task is turned into a structured plan:
 
 ```json
 {
@@ -186,11 +185,11 @@ The refined prompt is parsed into a structured task object:
 }
 ```
 
-LLM does this parsing. It is cheap — just a classification call with a small prompt.
+LLM does this planning. It is cheap — just a classification call with a small prompt.
 
-### Phase 2 — Planning
+### Phase 2 — Chunked Code Generation + Execution
 
-LLM receives the task and produces a structured plan. **No code yet.** Just a breakdown:
+LLM receives the analyzed task and produces a structured plan. **No code yet.** Just a breakdown:
 
 ```json
 {
@@ -216,7 +215,7 @@ LLM receives the task and produces a structured plan. **No code yet.** Just a br
     {
       "step": 4,
       "name": "format_and_save",
-      "description": "Apply formatting, headers, save to /workspace/output.xlsx",
+      "description": "Apply formatting, headers, save to the requested output path",
       "dependsOn": [3]
     }
   ],
@@ -249,7 +248,7 @@ Context passed to LLM on each turn:
 | Path | How assembly works |
 |------|-------------------|
 | **Word (V2)** | Orchestrator builds the final script deterministically (`buildAssemblyScript`) — no LLM for assembly |
-| **Excel / PDF / CSV / etc.** | LLM writes final step that saves to `/workspace/<outputFile>`; sent to Execify |
+| **Excel / PDF / CSV / etc.** | LLM writes final step that saves to the requested output path; sent to Execify |
 | **Local runner (`npm test`)** | Generates a single Python script and executes locally; writes to `tests/output/` |
 
 After assembly, the final script runs on Execify (or locally in test harnesses). The output file is produced.
@@ -336,7 +335,7 @@ For long jobs, we keep full bodies of the last 2 steps and replace older ones wi
 
 Prompts live in `src/llm/prompts.js` and are augmented by **`buildSkillPromptBlock()`** from `src/skills/loader.js`:
 
-- **Prompt refine** — `promptRefiner.js` (+ skill catalog from `getSkillCatalog()`)
+- **Prompt refine** — `taskAnalyzer.js` / `analyzeTask()` (+ skill catalog from `getSkillCatalog()`)
 - **Task parse** — `taskParser.js`
 - **Planner** — `buildPlannerPrompt` (+ skill summary for task type)
 - **Codegen** — `buildCodeGenPrompt`, `buildSectionPrompt` (Word V2)
@@ -360,13 +359,13 @@ Skills document APIs, `/workspace` paths (Execify), formula patterns, and common
 
 ## Local single-prompt runner (real files, no Execify)
 
-Use `tests/prompt.py` as the single prompt input. Run:
+Use `tests/prompt.js` as the single prompt input. Run:
 
 ```bash
 npm test
 ```
 
-The runner detects the task type from the prompt, plans the steps, generates code, and executes locally using Python. Output files are written to `tests/output/`.
+The runner detects the task type from the prompt, plans the steps, generates code, and executes locally with the right runtime for the task type. Output files are written to `tests/output/`.
 
 ---
 
@@ -495,8 +494,8 @@ Extend by adding task type + optional skill in `skills/index.json`.
 
 ### Phase 1.5 — Local single-prompt runner ✅ DONE
 
-- Single input file at `tests/prompt.py`
-- `npm test` plans, generates, and executes locally via Python
+- Single input file at `tests/prompt.js`
+- `npm test` plans, generates, and executes locally with the appropriate runtime
 - Outputs written to `tests/output/`
 
 ### Phase 2 — Chunked Generation
