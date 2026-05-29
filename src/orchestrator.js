@@ -10,8 +10,8 @@ const {
   buildSectionPrompt,
   buildSectionStructurePrompt,
 } = require('./llm/prompts');
-const { parseWithLLM } = require('./tasks/taskParser');
-const { refineUserPrompt } = require('./tasks/promptRefiner');
+const { analyzeTask } = require('./tasks/taskAnalyzer');
+const { parseLlmOutput } = require('./utils/llmParse');
 const { parseJsonFromLlm } = require('./utils/jsonExtract');
 const execify = require('./execify/client');
 const { validateResult, formatErrorForLLM } = require('./execify/validator');
@@ -20,21 +20,8 @@ const { buildBlueprint } = require('./content/blueprint');
 const { formatErrorForRetry } = require('./utils/errorClassifier');
 const { checkSectionContract, DEFAULT_DOCX_ALLOWED_CONSTRUCTORS } = require('./utils/contractChecker');
 const { TASK_TYPES, resolveRuntimeTask } = require('./tasks/taskTypes');
+const { MAX_RETRIES, DOCX_SECTION_IMPORTS } = require('./config');
 const logger = require('./utils/logger');
-
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '5');
-const DOCX_SECTION_IMPORTS = [
-  'Document',
-  'Paragraph',
-  'TextRun',
-  'Table',
-  'TableRow',
-  'TableCell',
-  'HeadingLevel',
-  'AlignmentType',
-  'BorderStyle',
-  'WidthType',
-];
 
 // ─── JOB STATE ────────────────────────────────────────────────────────────────
 // In-memory job store — replace with Redis for production
@@ -114,14 +101,9 @@ async function runJob(jobId) {
   addLog(job, 'Starting job...');
 
   try {
-    // ── PHASE 0: Refine vague prompt + pick task type from skill catalog ─────
-    addLog(job, 'Clarifying your request...');
-    const refinement = await refineUserPrompt(job.message, { complete: llmComplete });
-    updateJob(job, { refinement });
-
-    // ── PHASE 1: Parse task ──────────────────────────────────────────────────
-    addLog(job, 'Understanding your request...');
-    const parsedTask = await parseWithLLM(job.message, { complete: llmComplete }, { refinement });
+    // ── PHASE 0+1: Unified task analysis (replaces separate refine + parse) ──
+    addLog(job, 'Analyzing your request...');
+    const parsedTask = await analyzeTask(job.message, { complete: llmComplete });
     const execRuntime = execify.isMock === true ? 'test' : 'production';
     const task = resolveRuntimeTask(parsedTask, execRuntime);
     updateJob(job, { task });
@@ -156,12 +138,11 @@ async function runJob(jobId) {
 
 // ─── NON-WORD TASK FLOW (PLANNED) ───────────────────────────────────────────
 async function runPlannedJob({ job, task, jobId }) {
-  // ── PHASE 2: Plan ────────────────────────────────────────────────────────
+  // ── PHASE 2: Plan (YAML output — lighter tokens, more reliable) ──────────
   addLog(job, 'Planning the code structure...');
   const planPrompt = buildPlannerPrompt(task);
   const planRaw = await llmComplete(planPrompt, {
-    maxTokens: 2000,
-    jsonObject: true,
+    maxTokens: 3500,
     temperature: 0.15,
   });
   const plan = parsePlan(planRaw, task);
@@ -201,6 +182,7 @@ async function runPlannedJob({ job, task, jobId }) {
     verifiedFunctions.push({
       step: step.step,
       functionName: step.functionName,
+      function_name: step.function_name,
       returns: step.returns,
       description: step.description,
     });
@@ -661,56 +643,87 @@ function findFailingSectionId(errorText, sectionFunctions) {
   return null;
 }
 
+function normalizePlanStep(step) {
+  return {
+    step: step.step,
+    name: step.name,
+    functionName: step.function_name || step.functionName,
+    description: step.description,
+    contentSpec: step.content_spec || step.contentSpec || null,
+    returns: step.returns || 'unknown',
+    linesBudget: step.lines_budget || step.linesBudget || 120,
+    dependsOn: step.depends_on || step.dependsOn || [],
+    // Preserve original fields for codegen prompt
+    function_name: step.function_name || step.functionName,
+    content_spec: step.content_spec || step.contentSpec || null,
+    lines_budget: step.lines_budget || step.linesBudget || 120,
+    depends_on: step.depends_on || step.dependsOn || [],
+  };
+}
+
 function parsePlan(raw, task) {
-  const extracted = parseJsonFromLlm(raw);
-  if (extracted.ok && extracted.value?.steps && Array.isArray(extracted.value.steps)) {
-    return extracted.value;
+  // Try YAML first (new format), then JSON (legacy)
+  const parsed = parseLlmOutput(raw);
+
+  if (parsed.ok) {
+    const data = parsed.value;
+    // Handle nested plan: { plan: { steps: [...] } } or flat { steps: [...] }
+    const planData = data.plan || data;
+    const steps = planData.steps;
+    if (Array.isArray(steps) && steps.length > 0) {
+      return {
+        language: planData.language || task.language,
+        library: planData.library || task.preferredLibrary,
+        outputFile: planData.output_file || planData.outputFile || task.outputFile,
+        steps: steps.map(normalizePlanStep),
+      };
+    }
   }
 
-  const detail = extracted.ok ? 'missing steps array' : extracted.error;
-  try {
-    const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const parsed = JSON.parse(cleaned);
-    if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('No steps array');
-    return parsed;
-  } catch (err) {
-    logger.warn('Orchestrator', `Failed to parse plan JSON (${detail}), using fallback plan`, err.message);
-    // Fallback: simple 2-step plan
+  // JSON fallback
+  const jsonResult = parseJsonFromLlm(raw);
+  if (jsonResult.ok && jsonResult.value?.steps && Array.isArray(jsonResult.value.steps)) {
     return {
-      language: task.language,
-      library: task.preferredLibrary,
-      outputFile: task.outputFile,
-      steps: [
-        {
-          step: 1,
-          name: 'setup',
-          functionName: 'setup',
-          description: 'Import libraries and define helper data',
-          returns: 'config dict',
-          dependsOn: [],
-        },
-        {
-          step: 2,
-          name: 'generate_and_save',
-          functionName: 'generate_and_save',
-          description: `Generate ${task.label} and save to /workspace/${task.outputFile}`,
-          returns: 'filepath string',
-          dependsOn: [1],
-        },
-      ],
+      ...jsonResult.value,
+      steps: jsonResult.value.steps.map(normalizePlanStep),
     };
   }
+
+  logger.warn('Orchestrator', `Failed to parse plan (${parsed.error || 'no steps'}), using fallback`);
+  return {
+    language: task.language,
+    library: task.preferredLibrary,
+    outputFile: task.outputFile,
+    steps: [
+      normalizePlanStep({
+        step: 1,
+        name: 'setup',
+        function_name: 'setup',
+        description: 'Import libraries and define helper data/config',
+        returns: { type: 'dict', shape: 'config object' },
+        lines_budget: 50,
+        depends_on: [],
+      }),
+      normalizePlanStep({
+        step: 2,
+        name: 'generate_and_save',
+        function_name: 'generate_and_save',
+        description: `Generate ${task.label} and save to /workspace/${task.outputFile}`,
+        returns: { type: 'string', shape: 'filepath' },
+        lines_budget: 120,
+        depends_on: [1],
+      }),
+    ],
+  };
 }
 
 function cleanCode(raw) {
-  // Remove markdown code fences the LLM might have added
-  return raw
-    .replace(/^```python\n?/m, '')
-    .replace(/^```node\n?/m, '')
-    .replace(/^```javascript\n?/m, '')
-    .replace(/^```\n?/m, '')
-    .replace(/```$/m, '')
-    .trim();
+  let code = raw.trim();
+  // Strip opening fence with any language tag
+  code = code.replace(/^```\w*\s*\n?/, '');
+  // Strip closing fence
+  code = code.replace(/\n?```\s*$/, '');
+  return code.trim();
 }
 
 function getMimeType(taskType) {

@@ -1,33 +1,27 @@
 // src/utils/nodeAssembly.js
 // Deterministic assembly for local Node + docx chunked plans.
 
-const DOCX_PLANNED_IMPORTS = [
-  'Document',
-  'Packer',
-  'Paragraph',
-  'TextRun',
-  'Table',
-  'TableRow',
-  'TableCell',
-  'HeadingLevel',
-  'AlignmentType',
-  'BorderStyle',
-  'WidthType',
-  'ShadingType',
-  'LevelFormat',
-  'PageBreak',
-];
+const { DOCX_PLANNED_IMPORTS } = require('../config');
 
 function isAssemblyStep(step) {
   if (!step) return false;
-  const text = `${step.name || ''} ${step.description || ''} ${step.functionName || ''}`.toLowerCase();
-  return /final.*document|assemble|assembly|packer|write.*file|save.*docx|generate_and_save|create_final/.test(text);
+  // Only check name and functionName, NOT description — descriptions often contain
+  // words like "final" or "assemble" in non-assembly steps.
+  const name = (step.name || '').toLowerCase();
+  const fn = (step.functionName || '').toLowerCase();
+  const assembly = /^(assemble|assembly|save|pack|write_file|generate_and_save|create_final|final_assembly|assemble_and_save|save_document|format_and_save)$/;
+  if (assembly.test(name) || assembly.test(fn)) return true;
+  const combined = `${name} ${fn}`;
+  return /assemble.*save|save.*file|pack.*doc|write.*docx|final.*assem|generate_and_save/.test(combined);
 }
 
 function isSetupStep(step) {
   if (!step) return false;
-  const text = `${step.name || ''} ${step.functionName || ''}`.toLowerCase();
-  return /setup|imports|constants|config/.test(text);
+  const name = (step.name || '').toLowerCase();
+  const fn = (step.functionName || '').toLowerCase();
+  // Only match step 1 names, not things like "buildConfigSection"
+  return /^setup$|^setup_/.test(name) || /^setup$|^setup_/.test(fn) ||
+    (step.step === 1 && /setup|imports|constants/.test(name));
 }
 
 /** Steps whose return value is spread into the document body. */
@@ -38,7 +32,14 @@ function getSectionSteps(plan) {
 /** Steps sent to the LLM for codegen (no redundant final assembly step). */
 function getCodegenSteps(plan, task) {
   if (task?.language !== 'node' || task?.type !== 'word') return plan.steps || [];
-  return (plan.steps || []).filter(s => !isAssemblyStep(s));
+  const all = plan.steps || [];
+  const filtered = all.filter(s => !isAssemblyStep(s));
+  const skipped = all.filter(s => isAssemblyStep(s));
+  if (skipped.length > 0) {
+    const logger = require('../utils/logger');
+    logger.info('NodeAssembly', `Skipping assembly step(s): ${skipped.map(s => s.name || s.functionName).join(', ')}`);
+  }
+  return filtered;
 }
 
 function stripNodeStepBoilerplate(code) {
@@ -134,7 +135,17 @@ if (typeof setup === 'function') {
 async function main() {
   const allSections = [];
 ${callLines || '  // no section steps'}
-  const doc = new Document({ sections: [{ children: allSections }] });
+  const doc = new Document({
+    sections: [{
+      properties: {
+        page: {
+          size: { width: 12240, height: 15840 },
+          margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+        },
+      },
+      children: allSections,
+    }],
+  });
   const buffer = await Packer.toBuffer(doc);
   fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
   fs.writeFileSync(OUTPUT_PATH, buffer);

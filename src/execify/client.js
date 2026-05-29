@@ -4,7 +4,7 @@
 const logger = require('../utils/logger');
 
 const BASE_URL = process.env.EXECIFY_BASE_URL || 'http://localhost:3000';
-const API_KEY = process.env.EXECIFY_API_KEY || 'key-abc123';
+const API_KEY = process.env.EXECIFY_API_KEY || '';
 
 function headers() {
   return {
@@ -13,29 +13,45 @@ function headers() {
   };
 }
 
-async function httpPost(path, body) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: 'POST',
-    headers: headers(),
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Execify ${path} error ${res.status}: ${txt}`);
+const TIMEOUT_MS = parseInt(process.env.EXECIFY_TIMEOUT_MS || '60000', 10);
+
+async function httpPost(urlPath, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE_URL}${urlPath}`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`Execify ${urlPath} error ${res.status}: ${txt}`);
+    }
+    return res.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
-async function httpGet(path) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: 'GET',
-    headers: headers(),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Execify ${path} error ${res.status}: ${txt}`);
+async function httpGet(urlPath) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE_URL}${urlPath}`, {
+      method: 'GET',
+      headers: headers(),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`Execify ${urlPath} error ${res.status}: ${txt}`);
+    }
+    return res.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 // ─── PUBLIC API ───────────────────────────────────────────────────────────────

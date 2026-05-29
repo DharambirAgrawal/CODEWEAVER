@@ -3,12 +3,15 @@
 
 const logger = require('../utils/logger');
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GEMINI_TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS || '60000', 10);
 
 class GeminiClient {
   constructor(apiKey) {
     this.apiKey = apiKey;
     this.provider = 'gemini';
+    this.model = GEMINI_MODEL;
   }
 
   // Core completion — single turn, returns text string
@@ -28,13 +31,22 @@ class GeminiClient {
       generationConfig,
     };
 
-    const url = `${GEMINI_API_URL}?key=${this.apiKey}`;
+    const model = options.model || this.model;
+    const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${this.apiKey}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       const errText = await res.text();
@@ -43,7 +55,6 @@ class GeminiClient {
 
     const data = await res.json();
 
-    // Extract text from response
     const candidate = data.candidates?.[0];
     if (!candidate) throw new Error('Gemini returned no candidates');
 
@@ -54,11 +65,10 @@ class GeminiClient {
     const text = candidate.content?.parts?.map(p => p.text || '').join('') || '';
     if (!text) throw new Error('Gemini returned empty response');
 
-    logger.debug('Gemini', `Response: ${text.length} chars, finish: ${candidate.finishReason}`);
+    logger.debug('Gemini', `Response: ${text.length} chars (${model}), finish: ${candidate.finishReason}`);
     return text.trim();
   }
 
-  // Multi-turn conversation — takes history array, returns text
   async chat(history, options = {}) {
     const { maxTokens = 4096, temperature = 0.2, jsonObject = false } = options;
 
@@ -75,13 +85,22 @@ class GeminiClient {
       generationConfig,
     };
 
-    const url = `${GEMINI_API_URL}?key=${this.apiKey}`;
+    const model = options.model || this.model;
+    const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${this.apiKey}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       const errText = await res.text();

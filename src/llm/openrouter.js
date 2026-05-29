@@ -5,6 +5,7 @@ const logger = require('../utils/logger');
 
 const DEFAULT_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const OR_TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS || '60000', 10);
 
 function parseModelList() {
   const raw = process.env.OPENROUTER_MODELS || process.env.OPENROUTER_MODEL || '';
@@ -57,11 +58,19 @@ class OpenRouterClient {
           body.response_format = { type: 'json_object' };
         }
 
-        const res = await fetch(this.baseUrl, {
-          method: 'POST',
-          headers: buildHeaders(this.apiKey),
-          body: JSON.stringify(body),
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), OR_TIMEOUT_MS);
+        let res;
+        try {
+          res = await fetch(this.baseUrl, {
+            method: 'POST',
+            headers: buildHeaders(this.apiKey),
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
 
         if (!res.ok) {
           const errText = await res.text();

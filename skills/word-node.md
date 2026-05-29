@@ -103,6 +103,46 @@ Default font: prefer **Arial** in style definitions for broad compatibility.
 
 ---
 
+## Spacing and font sizes
+
+docx-js `TextRun({ size: N })` uses **half-points**: `size: 24` = 12pt, `size: 32` = 16pt.
+
+| Element | size (half-pt) | Notes |
+|---------|----------------|-------|
+| Cover title | 52–56 | bold, centered |
+| Heading 1 | 32 | bold, use `HeadingLevel.HEADING_1` |
+| Heading 2 | 28 | bold, use `HeadingLevel.HEADING_2` |
+| Body | 24 | normal weight |
+| Caption / footnote | 20 | italic optional |
+
+Paragraph spacing (twips; 240 twips ≈ one line):
+
+```javascript
+// Body paragraph
+new Paragraph({
+  spacing: { after: 200 },
+  children: [new TextRun({ text: 'Body text', size: 24 })],
+})
+
+// Section heading with extra gap after
+new Paragraph({
+  heading: HeadingLevel.HEADING_1,
+  spacing: { before: 400, after: 200 },
+  children: [new TextRun({ text: 'Section Title', bold: true, size: 32 })],
+})
+
+// Gap between major sections (alternative to page break)
+new Paragraph({ spacing: { after: 400 }, children: [] })
+```
+
+Section pattern for multi-section documents:
+1. Optional page break: `new Paragraph({ pageBreakBefore: true, children: [] })`
+2. H1 heading with `spacing: { after: 200 }`
+3. Body paragraphs with `spacing: { after: 200 }`
+4. Tables with cell margins: `{ top: 80, bottom: 80, left: 120, right: 120 }`
+
+---
+
 ## Lists (never use unicode bullets)
 
 ```javascript

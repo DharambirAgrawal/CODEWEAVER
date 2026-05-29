@@ -107,28 +107,25 @@ function detectTaskType(message) {
   return 'word';
 }
 
-// Estimate complexity from message
 function estimateComplexity(message) {
   const lower = message.toLowerCase();
 
-  // High complexity signals
-  if (
-    /1000|thousands|many pages|10 page|20 page|complex|detailed|comprehensive/.test(lower) ||
-    /multiple sheets|multiple sections|table of contents|charts and/.test(lower)
-  ) return 'high';
+  // Count quantitative signals
+  const numbers = message.match(/\b\d+\b/g) || [];
+  const maxNum = Math.max(0, ...numbers.map(Number).filter(n => n > 1));
 
-  // Low complexity signals
-  if (
-    /simple|basic|quick|small|short|just a/.test(lower) ||
-    /one page|single page|few rows/.test(lower)
-  ) return 'low';
+  if (maxNum >= 500 || /thousands|many pages|comprehensive|extensive/.test(lower) ||
+      /multiple sheets|multiple sections|table of contents|charts and/.test(lower) ||
+      /10\s*page|20\s*page|100\s*row|500\s*row|1000/.test(lower)) return 'high';
+
+  if (/simple|basic|quick|small|short|just a/.test(lower) ||
+      /one page|single page|few rows/.test(lower) || maxNum <= 10) return 'low';
 
   return 'medium';
 }
 
-// Estimate number of chunks needed based on complexity
 function estimateChunks(complexity) {
-  return { low: 2, medium: 3, high: 5 }[complexity] || 3;
+  return { low: 2, medium: 4, high: 6 }[complexity] || 3;
 }
 
 /**

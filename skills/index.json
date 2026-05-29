@@ -12,8 +12,8 @@
       "phases": {
         "plan": "summary",
         "setup": "summary",
-        "codegen": "full",
-        "section": "full",
+        "codegen": "sections",
+        "section": "sections",
         "assembly": "sections",
         "retry": "full"
       },
@@ -23,6 +23,27 @@
           "Common mistakes in CodeWeaver"
         ],
         "sections": {
+          "codegen": [
+            "CodeWeaver execution model",
+            "Page size",
+            "Spacing and font sizes",
+            "Tables",
+            "Lists (never use unicode bullets)",
+            "Headings and styles",
+            "Page breaks",
+            "Critical rules (docx-js)",
+            "Common mistakes in CodeWeaver"
+          ],
+          "section": [
+            "CodeWeaver execution model",
+            "Page size",
+            "Spacing and font sizes",
+            "Tables",
+            "Lists (never use unicode bullets)",
+            "Headings and styles",
+            "Critical rules (docx-js)",
+            "Common mistakes in CodeWeaver"
+          ],
           "assembly": [
             "CodeWeaver execution model",
             "Critical rules (docx-js)",
@@ -78,13 +99,17 @@
       "phaseSections": {
         "summary": [
           "CodeWeaver execution model",
+          "Supported imports",
+          "Invalid imports and APIs",
           "Common mistakes in CodeWeaver"
         ],
         "sections": {
           "assembly": [
             "CodeWeaver execution model",
+            "Supported imports",
+            "Invalid imports and APIs",
             "Common mistakes in CodeWeaver",
-            "Formula patterns in openpyxl"
+            "Formula patterns"
           ]
         }
       }

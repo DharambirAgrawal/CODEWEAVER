@@ -1,16 +1,17 @@
 // tests/runPrompt.js
-// Single-prompt local runner: reads tests/prompt.py, plans + generates code, and executes locally.
+// Single-prompt local runner: reads tests/prompt.js, plans + generates code, and executes locally.
 
 require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const YAML = require('yaml');
 const { execSync } = require('child_process');
 const { llmComplete, llmCompleteBestOfN, getProviderChain, providerHasKey } = require('../src/llm/client');
-const { parseWithLLM } = require('../src/tasks/taskParser');
-const { refineUserPrompt } = require('../src/tasks/promptRefiner');
+const { analyzeTask } = require('../src/tasks/taskAnalyzer');
 const { buildPlannerPrompt, buildCodeGenPrompt, buildRetryPrompt, setAvailableLibraries } = require('../src/llm/prompts');
+const { parseLlmOutput } = require('../src/utils/llmParse');
 const { parseJsonFromLlm } = require('../src/utils/jsonExtract');
 const { TASK_TYPES, resolveRuntimeTask } = require('../src/tasks/taskTypes');
 const { describeSelectedSkills } = require('../src/skills/loader');
@@ -25,7 +26,7 @@ const logger = require('../src/utils/logger');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
-const PROMPT_FILE = process.env.CW_PROMPT_FILE || path.join(__dirname, 'prompt.py');
+const PROMPT_FILE = process.env.CW_PROMPT_FILE || path.join(__dirname, 'prompt.js');
 const OUTPUT_DIR = process.env.CW_OUTPUT_DIR || path.join(__dirname, 'output');
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 const CODE_GEN_MAX_TOKENS = Math.min(
@@ -41,28 +42,47 @@ function shouldUseParallelForStep(task) {
   return getProviderChain().some(providerHasKey);
 }
 
-function extractPromptFromPython(text) {
-  const direct = text.match(/\bPROMPT\s*=\s*("""|''')([\s\S]*?)\1/);
-  if (direct && direct[2]) return direct[2].trim();
-
-  const alias = text.match(/\bPROMPT\s*=\s*([A-Z0-9_]+)/);
-  if (alias && alias[1]) {
-    const name = alias[1];
-    const re = new RegExp(`\\b${name}\\s*=\\s*("""|''')([\\s\\S]*?)\\1`);
-    const match = text.match(re);
-    if (match && match[2]) return match[2].trim();
+function extractPromptFromJsModule(filePath) {
+  try {
+    const resolved = require.resolve(filePath);
+    delete require.cache[resolved];
+    // eslint-disable-next-line global-require, import/no-dynamic-require
+    const mod = require(filePath);
+    if (typeof mod === 'string') return mod.trim();
+    if (mod && typeof mod.PROMPT === 'string') return mod.PROMPT.trim();
+    if (mod && mod.default && typeof mod.default.PROMPT === 'string') return mod.default.PROMPT.trim();
+    if (mod && typeof mod.default === 'string') return mod.default.trim();
+    return null;
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 function readPrompt() {
-  if (!fs.existsSync(PROMPT_FILE)) {
-    throw new Error(`Prompt file not found: ${PROMPT_FILE}`);
+  const defaultJs = path.join(__dirname, 'prompt.js');
+  let promptPath = PROMPT_FILE;
+
+  // If env var points to old prompt.py (or any missing file), fall back to prompt.js
+  if (!fs.existsSync(promptPath)) {
+    if (process.env.CW_PROMPT_FILE) {
+      console.warn(`CW_PROMPT_FILE points to missing file: ${promptPath}. Falling back to ${defaultJs}`);
+    }
+    promptPath = defaultJs;
   }
-  const text = fs.readFileSync(PROMPT_FILE, 'utf8');
-  const extracted = PROMPT_FILE.endsWith('.py') ? extractPromptFromPython(text) : null;
-  const prompt = (extracted || text).trim();
+
+  if (!(promptPath.endsWith('.js') || promptPath.endsWith('.cjs') || promptPath.endsWith('.mjs'))) {
+    // If user still has CW_PROMPT_FILE=tests/prompt.py, guide them cleanly.
+    throw new Error(
+      `Prompt file must be a JS module exporting PROMPT. Got: ${promptPath}. ` +
+      `Fix by unsetting CW_PROMPT_FILE or setting it to tests/prompt.js`,
+    );
+  }
+
+  if (!fs.existsSync(promptPath)) {
+    throw new Error(`Prompt file not found: ${promptPath}`);
+  }
+
+  const prompt = (extractPromptFromJsModule(promptPath) || '').trim();
   if (!prompt) throw new Error('Prompt file is empty');
   return prompt;
 }
@@ -78,54 +98,103 @@ function pickPython() {
   return 'python3';
 }
 
+function normalizePlanStep(step) {
+  return {
+    step: step.step,
+    name: step.name,
+    functionName: step.function_name || step.functionName,
+    description: step.description,
+    contentSpec: step.content_spec || step.contentSpec || null,
+    returns: step.returns || 'unknown',
+    linesBudget: step.lines_budget || step.linesBudget || 120,
+    dependsOn: step.depends_on || step.dependsOn || [],
+    function_name: step.function_name || step.functionName,
+    content_spec: step.content_spec || step.contentSpec || null,
+    lines_budget: step.lines_budget || step.linesBudget || 120,
+    depends_on: step.depends_on || step.dependsOn || [],
+  };
+}
+
 function parsePlan(raw, task) {
-  const extracted = parseJsonFromLlm(raw);
-  if (extracted.ok && extracted.value?.steps && Array.isArray(extracted.value.steps)) {
-    return extracted.value;
+  // Try YAML first, then JSON
+  const parsed = parseLlmOutput(raw);
+  if (parsed.ok) {
+    const data = parsed.value;
+    const planData = data.plan || data;
+    const steps = planData.steps;
+    if (Array.isArray(steps) && steps.length > 0) {
+      return {
+        language: planData.language || task.language,
+        library: planData.library || task.preferredLibrary,
+        outputFile: planData.output_file || planData.outputFile || task.outputFile,
+        steps: steps.map(normalizePlanStep),
+      };
+    }
   }
 
-  const detail = extracted.ok ? 'missing steps array' : extracted.error;
+  // Heuristic YAML salvage:
+  // Some models occasionally wrap YAML with extra text/braces that break the main parser.
+  // Try extracting from the first "plan:" occurrence and parse that fragment directly.
   try {
-    const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const parsed = JSON.parse(cleaned);
-    if (!parsed.steps || !Array.isArray(parsed.steps)) throw new Error('No steps array');
-    return parsed;
-  } catch (err) {
-    logger.warn('LocalRunner', `Failed to parse plan JSON (${detail}), using fallback plan`, err.message);
+    const planStart = String(raw || '').search(/\bplan\s*:/);
+    if (planStart >= 0) {
+      const fragment = String(raw).slice(planStart).trim();
+      const salvage = YAML.parse(fragment);
+      const planData = salvage?.plan || salvage;
+      const steps = planData?.steps;
+      if (Array.isArray(steps) && steps.length > 0) {
+        logger.info('LocalRunner', `Recovered plan via YAML salvage (${steps.length} steps)`);
+        return {
+          language: planData.language || task.language,
+          library: planData.library || task.preferredLibrary,
+          outputFile: planData.output_file || planData.outputFile || task.outputFile,
+          steps: steps.map(normalizePlanStep),
+        };
+      }
+    }
+  } catch {}
+
+  const jsonResult = parseJsonFromLlm(raw);
+  if (jsonResult.ok && jsonResult.value?.steps && Array.isArray(jsonResult.value.steps)) {
     return {
-      language: task.language,
-      library: task.preferredLibrary,
-      outputFile: task.outputFile,
-      steps: [
-        {
-          step: 1,
-          name: 'setup',
-          functionName: 'setup',
-          description: 'Import libraries and define helper data',
-          returns: 'config dict',
-          dependsOn: [],
-        },
-        {
-          step: 2,
-          name: 'generate_and_save',
-          functionName: 'generate_and_save',
-          description: `Generate ${task.label} and save to /workspace/${task.outputFile}`,
-          returns: 'filepath string',
-          dependsOn: [1],
-        },
-      ],
+      ...jsonResult.value,
+      steps: jsonResult.value.steps.map(normalizePlanStep),
     };
   }
+
+  logger.warn('LocalRunner', `Failed to parse plan (${parsed.error || 'no steps'}), using fallback`);
+  return {
+    language: task.language,
+    library: task.preferredLibrary,
+    outputFile: task.outputFile,
+    steps: [
+      normalizePlanStep({
+        step: 1,
+        name: 'setup',
+        function_name: 'setup',
+        description: 'Import libraries and define helper data/config',
+        returns: { type: 'dict', shape: 'config object' },
+        lines_budget: 50,
+        depends_on: [],
+      }),
+      normalizePlanStep({
+        step: 2,
+        name: 'generate_and_save',
+        function_name: 'generate_and_save',
+        description: `Generate ${task.label} and save to /workspace/${task.outputFile}`,
+        returns: { type: 'string', shape: 'filepath' },
+        lines_budget: 120,
+        depends_on: [1],
+      }),
+    ],
+  };
 }
 
 function cleanCode(raw) {
-  return raw
-    .replace(/^```python\n?/m, '')
-    .replace(/^```node\n?/m, '')
-    .replace(/^```javascript\n?/m, '')
-    .replace(/^```\n?/m, '')
-    .replace(/```$/m, '')
-    .trim();
+  let code = raw.trim();
+  code = code.replace(/^```\w*\s*\n?/, '');
+  code = code.replace(/\n?```\s*$/, '');
+  return code.trim();
 }
 
 function normalizeOutputPaths(code, outputPath) {
@@ -165,13 +234,214 @@ function validateStepSyntax(code, step, language) {
   }
 }
 
-function validateNodeWordSemantics(code, step, task) {
-  if (!usesNodeDocxAssembly(task)) return null;
-  const isSetup = /setup|imports|constants|config/i.test(`${step.name} ${step.functionName}`);
-  if (!isSetup && /docxConstructors/.test(code)) {
-    return `Invalid pattern in step "${step.name}": do not use setup().docxConstructors. Use top-level docx constructors directly (Paragraph, TextRun, Table, etc).`;
+function validateSemantics(code, step, task) {
+  const errors = [];
+  const isNodeWord = usesNodeDocxAssembly(task);
+  const isSetup = /^setup$|^setup_/i.test(step.functionName || step.name);
+
+  if (isNodeWord && !isSetup) {
+    if (/docxConstructors/.test(code)) {
+      errors.push('Do not use setup().docxConstructors — use Paragraph, TextRun, Table directly.');
+    }
+    // Ban mutating docx objects after construction — the #1 cause of runtime crashes
+    if (/\.rows\.push\s*\(/.test(code)) {
+      errors.push('Do not mutate table.rows after construction. Build ALL rows inside new Table({ rows: [...] }).');
+    }
+    if (/\.children\.push\s*\(/.test(code)) {
+      errors.push('Do not mutate .children after construction. Pass all children in the constructor.');
+    }
+    if (/\.cells\.push\s*\(/.test(code)) {
+      errors.push('Do not mutate .cells after construction. Pass all cells in the constructor.');
+    }
+    if (/new\s+Paragraph\s*\(\s*\{[^}]*numbering\s*:\s*\{[^}]*config\s*:/.test(code)) {
+      errors.push('numbering.config belongs on Document, not on Paragraph. Use numbering: { reference, level } on Paragraph.');
+    }
+    // Ban iterating over setup() results — setup() only returns scalars, not arrays
+    if (/setup\(\)\s*[\.\[]/m.test(code) || /(?:const|let|var)\s*\{[^}]+\}\s*=\s*setup\(\)/.test(code)) {
+      // Check if any destructured variable from setup() is then iterated
+      const setupDestructure = code.match(/(?:const|let|var)\s*\{([^}]+)\}\s*=\s*setup\(\)/);
+      if (setupDestructure) {
+        const keys = setupDestructure[1].split(',').map(k => k.trim().split(':')[0].trim()).filter(Boolean);
+        for (const key of keys) {
+          if (new RegExp(`\\b${key}\\s*\\.\\s*(?:forEach|map|filter|reduce|find|some|every|flat)\\b`).test(code)) {
+            errors.push(`Do not iterate over setup() result '${key}'. setup() returns scalars only. Hardcode all content arrays inside this function.`);
+          }
+        }
+      }
+    }
+  }
+
+  if (task.language === 'node') {
+    if (/WidthType\.PERCENTAGE/.test(code) && isNodeWord) {
+      errors.push('Use WidthType.DXA for table widths, not WidthType.PERCENTAGE.');
+    }
+  }
+
+  if (task.language === 'python') {
+    // These imports/APIs are invalid in common openpyxl versions and repeatedly cause retries.
+    if (/from\s+openpyxl\.styles\s+import\s+[^;\n]*(?:FontProperties|NumberFormat)\b/m.test(code)) {
+      errors.push(
+        'Invalid openpyxl styles import: FontProperties and NumberFormat do not exist. ' +
+        'Use Font for font styling and assign literal strings to cell.number_format.',
+      );
+    }
+    if (/\bNumberFormatDescriptor\s*\.\s*from_str\s*\(/m.test(code)) {
+      errors.push(
+        'Invalid openpyxl API: NumberFormatDescriptor.from_str does not exist. ' +
+        'Assign literal strings to cell.number_format, e.g. "$#,##0.00" or "0.0%".',
+      );
+    }
+    if (/from\s+openpyxl\.formatting\.number\s+import\s+/m.test(code)) {
+      errors.push(
+        'Invalid openpyxl import: use "from openpyxl.styles.numbers import FORMAT_CURRENCY_USD_SIMPLE" ' +
+        'or use explicit number formats as strings (e.g., "$#,##0.00").',
+      );
+    }
+    if (/from\s+openpyxl\.formatting\.number_format\s+import\s+/m.test(code)) {
+      errors.push(
+        'Invalid openpyxl import: use "from openpyxl.styles.numbers import FORMAT_CURRENCY_USD_SIMPLE" ' +
+        'or use explicit number formats as strings (e.g., "$#,##0.00").',
+      );
+    }
+  }
+
+  if (errors.length) {
+    return `Semantic errors in step "${step.name}": ${errors.join(' ')}`;
   }
   return null;
+}
+
+/**
+ * Runtime probe: actually execute the step function in a VM to catch
+ * errors like table.rows.push, undefined properties, wrong return type.
+ * Works for ALL Node task types, not just word+docx.
+ */
+async function validateNodeRuntime(code, step, task, verifiedFunctions) {
+  if (task.language !== 'node') return null;
+
+  const functionName = step.function_name || step.functionName;
+  if (!functionName) return 'Missing function name for runtime validation.';
+
+  const isSetup = /^setup$|^setup_/i.test(functionName);
+  const isNodeWord = usesNodeDocxAssembly(task);
+
+  const priorCode = (verifiedFunctions || [])
+    .map(v => v.code)
+    .filter(Boolean)
+    .join('\n\n');
+
+  // Build probe imports based on task type
+  let importLine = '';
+  if (isNodeWord) {
+    importLine = "const { Document, Paragraph, TextRun, Table, TableRow, TableCell, HeadingLevel, AlignmentType, BorderStyle, WidthType, ShadingType, LevelFormat, PageBreak } = require('docx');";
+  } else if (task.type === 'excel') {
+    importLine = "const XLSX = require('xlsx');";
+  }
+
+  // If setup() is not yet in priorCode (content steps before step-1 is verified,
+  // which shouldn't happen in normal flow but defend anyway), inject a Proxy stub
+  // so the probe doesn't crash on property access — we want to catch the content
+  // function's own bugs, not probe environment gaps.
+  const priorFunctionNames = (verifiedFunctions || []).map(v => v.function_name || v.functionName).filter(Boolean);
+  const setupInPrior = priorFunctionNames.includes('setup');
+
+  // Safety stub: if setup() hasn't been verified yet (shouldn't happen in normal
+  // sequential flow) return a safe object so the probe can still test the current
+  // step's structural correctness (Table API usage, return type etc.)
+  const setupSafetyWrap = (isNodeWord && !isSetup && !setupInPrior)
+    ? `function setup() {
+  // probe stub: returns safe defaults for any property so destructuring works
+  return new Proxy({}, {
+    get(_, k) {
+      return typeof k === 'string' ? '' : undefined;
+    }
+  });
+}`
+    : '';
+
+  // For non-setup steps in word mode, verify it returns an array
+  const checkReturn = (isNodeWord && !isSetup)
+    ? `if (!Array.isArray(out)) throw new Error('${functionName}() must return an array, got ' + typeof out);`
+    : '';
+
+  const probeSource = `
+${importLine}
+const fs = require('fs');
+const path = require('path');
+${setupSafetyWrap}
+${priorCode}
+${code}
+(async () => {
+  const out = typeof ${functionName} === 'function' ? await ${functionName}() : undefined;
+  ${checkReturn}
+})();
+`;
+
+  try {
+    const script = new vm.Script(probeSource, { filename: `probe_${step.step}_${functionName}.js` });
+    const context = vm.createContext({
+      require,
+      console: { log() {}, error() {}, warn() {} },
+      process: { env: {}, cwd: () => __dirname },
+      setTimeout,
+      clearTimeout,
+    });
+    const result = script.runInContext(context);
+    if (result && typeof result.then === 'function') {
+      await Promise.race([
+        result,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Runtime probe timed out after 8s')), 8000)),
+      ]);
+    }
+    return null;
+  } catch (err) {
+    // Surface full stack so the retry prompt has something actionable
+    const msg = err.message || String(err);
+    const stack = err.stack ? err.stack.split('\n').slice(0, 5).join(' | ') : '';
+    const detail = stack ? `${msg} [stack: ${stack}]` : msg;
+    return `Runtime probe failed for step "${step.name}": ${detail}`;
+  }
+}
+
+/**
+ * Runtime probe for Python steps via subprocess.
+ */
+async function validatePythonRuntime(code, step, task, verifiedFunctions) {
+  if (task.language !== 'python') return null;
+
+  const functionName = step.function_name || step.functionName;
+  if (!functionName) return null;
+
+  const priorCode = (verifiedFunctions || [])
+    .map(v => v.code)
+    .filter(Boolean)
+    .join('\n\n');
+
+  const probeScript = `
+import sys, os
+${priorCode}
+${code}
+try:
+    result = ${functionName}()
+    print("PROBE_OK")
+except Exception as e:
+    print(f"PROBE_FAIL: {e}", file=sys.stderr)
+    sys.exit(1)
+`;
+
+  const tmpFile = path.join(OUTPUT_DIR, `_probe_${step.step}.py`);
+  try {
+    fs.writeFileSync(tmpFile, probeScript);
+    const pythonExe = pickPython();
+    execSync(`${pythonExe} "${tmpFile}"`, { stdio: 'pipe', timeout: 10000 });
+    return null;
+  } catch (err) {
+    const stderr = err.stderr ? err.stderr.toString().trim() : (err.message || String(err));
+    const lastLines = stderr.split('\n').slice(-3).join(' ');
+    return `Runtime probe failed for step "${step.name}": ${lastLines}`;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
 }
 
 async function generateStepCode(task, plan, step, verifiedFunctions) {
@@ -200,16 +470,28 @@ async function generateStepCode(task, plan, step, verifiedFunctions) {
       }
       if (!hasFunction(code, step.functionName, task.language)) {
         lastError = `Missing function ${step.functionName}()`;
+        logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${lastError}`);
         continue;
       }
       const syntaxError = validateStepSyntax(code, step, task.language);
       if (syntaxError) {
         lastError = syntaxError;
+        logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: syntax error`);
         continue;
       }
-      const semanticError = validateNodeWordSemantics(code, step, task);
+      const semanticError = validateSemantics(code, step, task);
       if (semanticError) {
         lastError = semanticError;
+        logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${semanticError}`);
+        continue;
+      }
+      // Runtime probe — actually execute the function to catch API misuse
+      const runtimeError = task.language === 'node'
+        ? await validateNodeRuntime(code, step, task, verifiedFunctions)
+        : await validatePythonRuntime(code, step, task, verifiedFunctions);
+      if (runtimeError) {
+        lastError = runtimeError;
+        logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${runtimeError}`);
         continue;
       }
       return code;
@@ -268,8 +550,8 @@ async function main() {
   console.log('  CodeWeaver — Single Prompt Local Runner');
   console.log('═'.repeat(70));
 
-  if (!process.env.GEMINI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
-    throw new Error('No LLM API key. Set GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY in .env');
+  if (!process.env.GEMINI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY && !process.env.NVIDIA_API_KEY) {
+    throw new Error('No LLM API key. Set GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, or NVIDIA_API_KEY in .env');
   }
 
   const promptText = readPrompt();
@@ -280,16 +562,16 @@ async function main() {
     node: ['fs', 'path', 'xlsx', 'docx'],
   });
 
-  console.log('Refining prompt...');
-  const refinement = await refineUserPrompt(promptText, { complete: llmComplete });
-  if (refinement.refinedPrompt !== promptText) {
-    console.log(`Refined (${promptText.length} → ${refinement.refinedPrompt.length} chars)`);
-    if (refinement.taskType) console.log(`Suggested type: ${refinement.taskType}`);
-    console.log('');
-  }
-
-  let task = await parseWithLLM(promptText, { complete: llmComplete }, { refinement });
+  console.log('Analyzing task...');
+  let task = await analyzeTask(promptText, { complete: llmComplete });
   task = resolveRuntimeTask(task, 'local');
+  if (task.refinedMessage !== promptText) {
+    console.log(`Refined (${promptText.length} → ${task.refinedMessage.length} chars)`);
+  }
+  if (task.volume) {
+    const vol = Object.entries(task.volume).filter(([, v]) => v != null).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    if (vol.length) console.log(`Volume: ${vol.join(' | ')}`);
+  }
   const outputPath = path.resolve(OUTPUT_DIR, task.outputFile);
 
   console.log(`Prompt file: ${PROMPT_FILE}`);
@@ -309,33 +591,58 @@ async function main() {
     throw new Error(`Local runner supports python and node only. Task language: ${task.language}`);
   }
 
+  console.log('Planning...');
   const planRaw = await llmComplete(buildPlannerPrompt(task), {
-    maxTokens: 2500,
-    jsonObject: true,
+    maxTokens: 3500,
     temperature: 0.15,
   });
+
+  // Save raw plan so user can always inspect what the LLM produced
+  const planSavePath = path.join(OUTPUT_DIR, 'plan.yaml');
+  fs.writeFileSync(planSavePath, planRaw);
+  console.log(`Plan saved to: ${planSavePath}`);
+
   const plan = parsePlan(planRaw, task);
 
-  console.log(`Plan steps: ${plan.steps.length}`);
+  console.log(`\nPlan: ${plan.steps.length} steps`);
+  console.log('─'.repeat(70));
   plan.steps.forEach(s => {
     const deps = Array.isArray(s.dependsOn) && s.dependsOn.length ? s.dependsOn.join(',') : '-';
-    console.log(`  - ${s.step}. ${s.name} (${s.functionName}) deps:[${deps}]`);
+    const budget = s.linesBudget || s.lines_budget || '?';
+    const ret = typeof s.returns === 'object'
+      ? `${s.returns.type || '?'}${s.returns.shape ? ': ' + s.returns.shape : ''}`
+      : (s.returns || '?');
+    const desc = typeof s.description === 'string' ? s.description.slice(0, 100) : '';
+    const spec = s.contentSpec || s.content_spec;
+    const specPreview = spec
+      ? (typeof spec === 'string' ? spec : JSON.stringify(spec)).slice(0, 120)
+      : '';
+    console.log(`  ${s.step}. ${s.functionName}()  ~${budget}L  deps:[${deps}]  → ${ret}`);
+    if (desc) console.log(`     ${desc}`);
+    if (specPreview) console.log(`     spec: ${specPreview}${specPreview.length >= 120 ? '...' : ''}`);
   });
+  console.log('─'.repeat(70));
   console.log('');
 
   const codegenSteps = getCodegenSteps(plan, task);
   const stepCodes = [];
   const verified = [];
   const runStart = Date.now();
-  for (const step of codegenSteps) {
+  for (let i = 0; i < codegenSteps.length; i++) {
+    const step = codegenSteps[i];
     const stepStart = Date.now();
-    console.log(`Generating step ${step.step}/${codegenSteps.length}: ${step.name}`);
+    console.log(`Generating step ${i + 1}/${codegenSteps.length}: ${step.name}`);
     const code = await generateStepCode(task, plan, step, verified);
     stepCodes.push(code);
-    verified.push({ functionName: step.functionName, returns: step.returns });
+    verified.push({
+      functionName: step.functionName,
+      function_name: step.function_name,
+      returns: step.returns,
+      code,
+    });
     const elapsed = ((Date.now() - stepStart) / 1000).toFixed(1);
     const totalElapsed = ((Date.now() - runStart) / 1000).toFixed(1);
-    console.log(`Completed step ${step.step}/${codegenSteps.length}: ${step.name} (${elapsed}s, total ${totalElapsed}s)`);
+    console.log(`Completed step ${i + 1}/${codegenSteps.length}: ${step.name} (${elapsed}s, total ${totalElapsed}s)`);
   }
 
   const isNode = task.language === 'node';

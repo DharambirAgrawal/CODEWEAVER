@@ -4,8 +4,8 @@
 const logger = require('../utils/logger');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-/** Same-model retries after 429/503 before switching to the next fallback model */
 const GROQ_RATE_LIMIT_RETRIES = 4;
+const GROQ_TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS || '60000', 10);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -21,13 +21,14 @@ function groqSuggestedRetryMs(errBody) {
 
 // Models ordered by preference — falls through on 429/503
 // Prioritize higher quality, then broader availability/capacity.
+// Ordered by free-tier token limits — larger limits first to avoid 413 errors.
+// llama-3.1-8b-instant has highest free TPM/TPD; larger models hit limits fast.
 const FALLBACK_MODELS = [
-  'openai/gpt-oss-120b',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'llama-3.1-8b-instant',
+  'openai/gpt-oss-20b',
   'qwen/qwen3-32b',
   'llama-3.3-70b-versatile',
-  'meta-llama/llama-4-scout-17b-16e-instruct',
-  'openai/gpt-oss-20b',
-  'llama-3.1-8b-instant',
 ];
 
 class GroqClient {
@@ -62,14 +63,22 @@ class GroqClient {
             body.response_format = { type: 'json_object' };
           }
 
-          const res = await fetch(GROQ_API_URL, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${this.apiKey}`,
-            },
-            body: JSON.stringify(body),
-          });
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+          let res;
+          try {
+            res = await fetch(GROQ_API_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${this.apiKey}`,
+              },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timer);
+          }
 
           if (res.ok) {
             const data = await res.json();
