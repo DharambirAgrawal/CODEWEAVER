@@ -51,40 +51,9 @@ function stripNodeStepBoilerplate(code) {
     .trim();
 }
 
-/**
- * Build a runnable script: shared imports, section functions, deterministic main().
- */
-function buildNodeDocxAssemblyScript({ plan, stepCodes, outputPath }) {
-  const codegenSteps = getCodegenSteps(plan, { language: 'node', type: 'word' });
-  const sectionSteps = getSectionSteps(plan);
-
-  if (stepCodes.length !== codegenSteps.length) {
-    throw new Error(
-      `Step code count (${stepCodes.length}) does not match plan (${codegenSteps.length})`,
-    );
-  }
-
-  const sanitized = stepCodes.map(stripNodeStepBoilerplate);
-  const blocks = sanitized.map((body, i) => ({
-    step: codegenSteps[i],
-    body,
-  }));
-
-  const pathMod = require('path');
-  const outputFileName = pathMod.basename(outputPath);
-
-  const importBlock = [
-    "const fs = require('fs');",
-    "const path = require('path');",
-    `const { ${DOCX_PLANNED_IMPORTS.join(', ')} } = require('docx');`,
-  ].join('\n');
-
-  const callLines = sectionSteps.map(step => {
-    const fn = step.functionName;
-    return `  await pushBlocks(allSections, ${fn});`;
-  }).join('\n');
-
-  const helperBlock = `
+/** Shared cw* helper source injected into assembly scripts and runtime probes. */
+function buildDocxHelperBlock() {
+  return `
 // ─── Harness helpers (use these — do NOT redefine) ─────────────────────────
 const __cwBorder = { style: BorderStyle.SINGLE, size: 1, color: 'BBBBBB' };
 const __cwBorders = { top: __cwBorder, bottom: __cwBorder, left: __cwBorder, right: __cwBorder };
@@ -176,6 +145,42 @@ function cwTable(rows) {
   });
 }
 `;
+}
+
+/**
+ * Build a runnable script: shared imports, section functions, deterministic main().
+ */
+function buildNodeDocxAssemblyScript({ plan, stepCodes, outputPath }) {
+  const codegenSteps = getCodegenSteps(plan, { language: 'node', type: 'word' });
+  const sectionSteps = getSectionSteps(plan);
+
+  if (stepCodes.length !== codegenSteps.length) {
+    throw new Error(
+      `Step code count (${stepCodes.length}) does not match plan (${codegenSteps.length})`,
+    );
+  }
+
+  const sanitized = stepCodes.map(stripNodeStepBoilerplate);
+  const blocks = sanitized.map((body, i) => ({
+    step: codegenSteps[i],
+    body,
+  }));
+
+  const pathMod = require('path');
+  const outputFileName = pathMod.basename(outputPath);
+
+  const importBlock = [
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const { ${DOCX_PLANNED_IMPORTS.join(', ')} } = require('docx');`,
+  ].join('\n');
+
+  const callLines = sectionSteps.map(step => {
+    const fn = step.functionName;
+    return `  await pushBlocks(allSections, ${fn});`;
+  }).join('\n');
+
+  const helperBlock = buildDocxHelperBlock();
 
   return `${importBlock}
 
@@ -332,6 +337,7 @@ module.exports = {
   getSectionSteps,
   getCodegenSteps,
   stripNodeStepBoilerplate,
+  buildDocxHelperBlock,
   buildNodeDocxAssemblyScript,
   usesNodeDocxAssembly,
 };

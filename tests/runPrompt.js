@@ -22,6 +22,7 @@ const {
   getCodegenSteps,
   getSectionSteps,
   stripNodeStepBoilerplate,
+  buildDocxHelperBlock,
   usesNodeDocxAssembly,
 } = require('../src/utils/nodeAssembly');
 const logger = require('../src/utils/logger');
@@ -475,6 +476,7 @@ async function validateNodeRuntime(code, step, task, verifiedFunctions) {
 ${importLine}
 const fs = require('fs');
 const path = require('path');
+${isNodeWord ? buildDocxHelperBlock() : ''}
 ${setupSafetyWrap}
 ${priorCode}
 ${code}
