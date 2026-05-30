@@ -313,7 +313,7 @@ function validateStepSyntax(code, step, language) {
   }
 }
 
-function validateSemantics(code, step, task, plan) {
+function validateSemantics(code, step, task, plan, verifiedFunctions = []) {
   const errors = [];
   const isNodeWord = usesNodeDocxAssembly(task);
   const isSetup = /^setup$|^setup_/i.test(step.functionName || step.name);
@@ -335,6 +335,29 @@ function validateSemantics(code, step, task, plan) {
     if (/new\s+Paragraph\s*\(\s*\{[^}]*numbering\s*:\s*\{[^}]*config\s*:/.test(code)) {
       errors.push('numbering.config belongs on Document, not on Paragraph. Use numbering: { reference, level } on Paragraph.');
     }
+
+    // Reject config/setup().key when key is not defined in verified setup() code
+    const setupEntry = verifiedFunctions.find(v => (v.functionName || v.function_name) === 'setup');
+    if (setupEntry?.code) {
+      const setupKeys = new Set();
+      for (const m of setupEntry.code.matchAll(/^\s*(\w+)\s*:/gm)) {
+        setupKeys.add(m[1]);
+      }
+      const refPattern = /(?:config|setup\(\))\.(\w+)/g;
+      const missing = new Set();
+      let ref;
+      while ((ref = refPattern.exec(code)) !== null) {
+        const key = ref[1];
+        if (key && !setupKeys.has(key)) missing.add(key);
+      }
+      if (missing.size) {
+        errors.push(
+          `References setup/config keys not defined in setup(): ${Array.from(missing).join(', ')}. ` +
+          'Either add them to setup() or hardcode fictional values inline (e.g. IP "203.0.113.45", domain "evil-c2.example.com").',
+        );
+      }
+    }
+
     // Ban iterating over setup() results — setup() only returns scalars, not arrays
     if (/setup\(\)\s*[\.\[]/m.test(code) || /(?:const|let|var)\s*\{[^}]+\}\s*=\s*setup\(\)/.test(code)) {
       // Check if any destructured variable from setup() is then iterated
@@ -467,9 +490,25 @@ async function validateNodeRuntime(code, step, task, verifiedFunctions) {
 }`
     : '';
 
-  // For non-setup steps in word mode, verify it returns an array
+  // For non-setup steps in word mode, verify return type and no literal "undefined" in text
   const checkReturn = (isNodeWord && !isSetup)
-    ? `if (!Array.isArray(out)) throw new Error('${functionName}() must return an array, got ' + typeof out);`
+    ? `if (!Array.isArray(out)) throw new Error('${functionName}() must return an array, got ' + typeof out);
+  function __cwCollectText(node, acc) {
+    if (!node || typeof node !== 'object') return;
+    if (node.root && node.root) {
+      const opts = node.root;
+      if (opts.text) acc.push(String(opts.text));
+      if (Array.isArray(opts.children)) opts.children.forEach(c => __cwCollectText(c, acc));
+    }
+    if (node.text) acc.push(String(node.text));
+    if (Array.isArray(node.children)) node.children.forEach(c => __cwCollectText(c, acc));
+  }
+  const __cwTexts = [];
+  out.forEach(b => __cwCollectText(b, __cwTexts));
+  const __cwJoined = __cwTexts.join(' ');
+  if (/\\bundefined\\b/.test(__cwJoined)) {
+    throw new Error('Output contains literal "undefined" — hardcode fictional values or add missing keys to setup()');
+  }`
     : '';
 
   const probeSource = `
@@ -635,7 +674,7 @@ async function generateStepCode(task, plan, step, verifiedFunctions, outputPath)
         logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: syntax error`);
         continue;
       }
-      const semanticError = validateSemantics(code, step, task, plan);
+      const semanticError = validateSemantics(code, step, task, plan, verifiedFunctions);
       if (semanticError) {
         lastError = semanticError;
         logger.warn('LocalRunner', `Step ${step.name} attempt ${attempt}: ${semanticError}`);

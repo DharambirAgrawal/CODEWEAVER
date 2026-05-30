@@ -156,7 +156,10 @@ function buildNewPlannerPrompt(context) {
 - step_2+ are section functions. Each returns an array of docx block elements.
   Signature: buildSectionName() → blocks   (NEVER addX(doc) → doc chaining)
 - Do NOT add finalize/save/assemble/pack steps — the harness builds Document + Packer automatically.
-- Create ONE step per numbered section in the user requirements. Do NOT merge, skip, or combine sections.
+- Create ONE step per numbered section in the user requirements. Do NOT merge, skip, or combine sections (e.g. Lessons Learned and Appendix must be separate steps).
+- setup() config must ONLY include keys relevant to THIS task — do not copy generic template fields (regions, kpi_labels) unless the prompt asks for them.
+- When a section lists structured data (IPs, domains, hashes, log lines, timeline entries), specify a table or bullet list with example fictional values in do: (use RFC 5737 IPs like 203.0.113.45, fictional domains like evil-c2.example.com, fake SHA256 hashes).
+- If content steps need values from setup(), list those exact key names in step_1 do: so setup defines them.
 - page_break: true ONLY for major section starts (cover, executive summary, financial highlights, etc.). Tables and subsections within a section share the same page — do NOT force one table per page.
 - Every content step MUST include ALL fields: fn, do, heading, page_break, paragraphs, words, table (if applicable), returns.
 - For tables: copy exact column names and row counts from requirements. column widths must sum to 9360 DXA.
@@ -197,7 +200,7 @@ ${task_type === 'excel' || task_type === 'csv' ? 'rows: N' : ''}`;
   const setupStepExample = isNodeWord
     ? `## step_1
 fn: setup() → config
-do: Shared config: company title, report subtitle, date, confidentiality note, regions [NA, EMEA, APAC, LATAM, ANZ], product names, kpi_labels array with all 12 KPI names from requirements, section_titles array
+do: Shared config ONLY for keys used across sections: companyTitle, reportSubtitle, date, confidentialityNote, sectionTitles array. List every key other steps will read (e.g. suspiciousIp, suspiciousDomain if IoC step needs them). Use fictional example values in do: — NOT real infrastructure.
 heading: 0
 page_break: false
 paragraphs: 0
@@ -258,7 +261,8 @@ ${wordStepFields}
 4. ${task_type === 'word' ? 'words: is REQUIRED on every content step. Sum of words: must meet total_words target.' : 'rows: is REQUIRED on the data-population step.'}
 5. ${quantities?.total_words ? `The sum of all words: values must be >= ${quantities.total_words}` : 'Use specific numeric targets in every content step.'}
 6. Copy exact counts from requirements (12 KPIs, 5 case studies, 10 goals, etc.) — do not round down or simplify.
-7. Output ONLY the plan block. No explanation before or after.`;
+7. Count numbered sections in requirements — plan must have setup + one step per numbered section (if prompt has 10 sections, plan has 11 steps including setup).
+8. Output ONLY the plan block. No explanation before or after.`;
 }
 
 // ── 2.3 Plan correction prompt (targeted retry) ───────────────────────────────
@@ -620,6 +624,11 @@ CONTENT QUALITY (critical):
 - Each prose paragraph must be 2-4 full sentences with specific facts/numbers — NOT one-liner generics.
 - Write ALL required rows in cwTable data — never pad with empty rows.
 - setup() keys must match usage: if setup returns companyTitle, use setup().companyTitle (not setup().title).
+- For IPs, domains, hashes, timelines: HARDCODE realistic fictional values inline OR define them in setup() first.
+  NEVER use config.someKey unless someKey exists in setup(). Literal "undefined" in output is an instant failure.
+  Example IPs: 203.0.113.45, 198.51.100.22 (documentation ranges). Example domain: evil-c2.example.com.
+  Example hash: a3b2c1d4e5f6789012345678901234567890abcd1234567890abcd1234567890
+- If you build a data array (timelineData, logLines), you MUST render it (cwBullet, cwTable, cwPara) — do not leave it unused.
 
 FORMATTING:
 - alignment goes on Paragraph (cwCenter/cwPara), NEVER on TextRun
