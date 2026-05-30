@@ -139,3 +139,52 @@ ws.add_chart(chart, "E2")
 - Keep formulas relative or absolute intentionally, e.g. `$B$2` for assumptions.
 - Use one-based row and column indexes with openpyxl.
 - Do not open a formula workbook with `data_only=True` and then save it; that can remove formulas.
+
+---
+
+## quantity_patterns
+
+### Writing N data rows with a loop
+
+When a step has `rows: N`, always use `range(N)`. Never write rows by hand.
+
+```python
+# WRONG — manual rows:
+ws.append(['North', 120000, 450])
+ws.append(['South', 98000, 380])
+
+# CORRECT — loop for N rows:
+regions = ['North', 'South', 'East', 'West']
+products = ['Widget A', 'Widget B', 'Widget C']
+for i in range(60):
+    region = regions[i % len(regions)]
+    product = products[i % len(products)]
+    revenue = 80000 + (i * 1500) + (i % 7) * 3000
+    units = 300 + (i % 12) * 25
+    ws.append([region, product, f'2024-{(i % 12) + 1:02d}', revenue, units])
+```
+
+### Varied data rule
+
+Every column must have varied values across rows. Use modulo or date arithmetic:
+
+```python
+from datetime import date, timedelta
+start = date(2022, 1, 1)
+for i in range(N):
+    row_date = start + timedelta(days=i * 7)
+    # ...
+```
+
+### bulk_data
+
+For large row counts (>100), use Python list comprehension or loop generation:
+
+```python
+data = [
+    [regions[i % len(regions)], products[i % len(products)], 80000 + i * 1200, 300 + i % 50]
+    for i in range(total_rows)
+]
+for row in data:
+    ws.append(row)
+```

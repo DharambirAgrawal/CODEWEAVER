@@ -210,3 +210,61 @@ Execify checks that:
 - Optional row-count hints match task requirements
 
 Generated code must actually run `XLSX.writeFile` (or equivalent) in the final step so the file appears in `/workspace/`.
+
+---
+
+## quantity_patterns
+
+### Writing N data rows with a loop
+
+When a step has `rows: N`, use a loop. Never write rows manually.
+
+```javascript
+// WRONG — manual rows, will never hit large targets:
+function buildData() {
+  return [
+    ['Region', 'Revenue', 'Units'],
+    ['North', 120000, 450],
+    ['South', 98000, 380],
+  ];
+}
+
+// CORRECT — loop generates the required row count:
+function buildData() {
+  const regions = ['North', 'South', 'East', 'West'];
+  const rows = [['Region', 'Month', 'Revenue', 'Units', 'Growth%']];
+  for (let i = 0; i < 60; i++) {
+    const region = regions[i % regions.length];
+    const month = `2024-${String((i % 12) + 1).padStart(2, '0')}`;
+    rows.push([region, month, Math.floor(80000 + Math.random() * 120000), Math.floor(300 + Math.random() * 400), +(Math.random() * 0.25).toFixed(3)]);
+  }
+  return rows;
+}
+```
+
+### Column hints
+
+If column names are provided in the task spec, use them exactly as the header row:
+
+```javascript
+// column_hints: ['Date', 'Product', 'Region', 'Revenue', 'Units', 'Profit']
+const headers = ['Date', 'Product', 'Region', 'Revenue', 'Units', 'Profit'];
+const rows = [headers];
+for (let i = 0; i < N; i++) {
+  rows.push([/* ... */]);
+}
+```
+
+### Varied data
+
+Data must be varied — not all the same value. Use modulo, random, or date sequences:
+
+```javascript
+const products = ['Widget A', 'Widget B', 'Widget C'];
+const regions = ['North', 'South', 'East', 'West'];
+for (let i = 0; i < N; i++) {
+  const product = products[i % products.length];
+  const region = regions[Math.floor(i / products.length) % regions.length];
+  // ...
+}
+```

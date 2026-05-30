@@ -262,6 +262,125 @@ function getSkillCatalog() {
   return { skills, taskTypes };
 }
 
+// ── New: section-level extraction for the new pipeline ───────────────────────
+
+/**
+ * Parse a full skill file body into named sections keyed by ## heading.
+ * Used by the new step-level code generator to inject only the relevant section.
+ *
+ * @param {string} skillRaw  - full skill file content (without frontmatter)
+ * @returns {object}  { overview: string, imports: string, setup: string, ... }
+ */
+function extractSkillSections(skillRaw) {
+  const sections = {};
+  let current = 'overview';
+  sections[current] = [];
+
+  for (const line of (skillRaw || '').split('\n')) {
+    const h2 = line.match(/^##\s+(.+)/);
+    const h3 = line.match(/^###\s+(.+)/);
+    const heading = (h2 || h3)?.[1]?.toLowerCase().replace(/\s+/g, '_');
+    if (heading) {
+      current = heading;
+      if (!sections[current]) sections[current] = [];
+    } else {
+      if (!sections[current]) sections[current] = [];
+      sections[current].push(line);
+    }
+  }
+
+  return Object.fromEntries(
+    Object.entries(sections).map(([k, v]) => [k, v.join('\n').trim()]),
+  );
+}
+
+/**
+ * Pick the most relevant skill section for a given step.
+ * Keeps token usage focused on what the LLM actually needs.
+ *
+ * @param {object} step          - plan step with title and do fields
+ * @param {object} skillSections - output of extractSkillSections()
+ * @param {string} taskType      - 'word' | 'excel' | 'chart' | etc.
+ * @param {string} [skillRaw]    - full raw skill text (fallback)
+ * @returns {string}
+ */
+function pickSkillSection(step, skillSections, taskType, skillRaw) {
+  const title = (step.title || '').toLowerCase();
+  const doText = (step.do || '').toLowerCase();
+  const fallback = skillSections.overview || (skillRaw || '').slice(0, 1500);
+
+  // Imports step
+  if (title === 'imports' || title.includes('import')) {
+    return skillSections.imports || skillSections.dependencies || fallback;
+  }
+
+  // Setup / init step
+  if (title.includes('setup') || title.includes('create') || title.includes('init')) {
+    return skillSections.setup || skillSections.document_setup || fallback;
+  }
+
+  // Word content steps
+  if (taskType === 'word') {
+    if (doText.includes('table')) {
+      return skillSections.tables || fallback;
+    }
+    if (doText.includes('image') || doText.includes('picture')) {
+      return skillSections.images || fallback;
+    }
+    if (doText.includes('heading') || doText.includes('section')) {
+      return skillSections.headings || skillSections.paragraphs || fallback;
+    }
+    return skillSections.paragraphs || fallback;
+  }
+
+  // Excel steps
+  if (taskType === 'excel') {
+    if (doText.includes('header') || doText.includes('style') || doText.includes('format')) {
+      return skillSections.styling || skillSections.formatting || fallback;
+    }
+    if (doText.includes('formula') || doText.includes('sum') || doText.includes('average')) {
+      return skillSections.formulas || fallback;
+    }
+    if (doText.includes('chart') || doText.includes('graph')) {
+      return skillSections.charts || fallback;
+    }
+    return skillSections.writing_data || skillSections.bulk_data || skillSections.large_tables || fallback;
+  }
+
+  // Chart steps
+  if (taskType === 'chart') {
+    return skillSections.chart_types || skillSections.styling || fallback;
+  }
+
+  return fallback;
+}
+
+/**
+ * Load a skill file by task type + runtime and return its extracted sections.
+ * @param {string} taskType  - 'word' | 'excel' | 'chart' | 'csv'
+ * @param {string} language  - 'python' | 'node'
+ * @param {string} library   - e.g. 'openpyxl', 'docx'
+ * @returns {{ skill_raw: string, skill_sections: object } | null}
+ */
+function loadSkillForTask(taskType, language, library) {
+  const index = loadIndex();
+  const context = { taskType, language, library };
+  const matches = (index.skills || []).filter(entry => skillMatches(entry, context));
+
+  if (!matches.length) return null;
+
+  try {
+    const entry = matches[0];
+    const { body } = loadSkillFile(entry.file);
+    return {
+      skill_raw: body,
+      skill_sections: extractSkillSections(body),
+    };
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   selectSkills,
   buildSkillPromptBlock,
@@ -269,5 +388,8 @@ module.exports = {
   getSkillContent,
   getSkillCatalog,
   clearSkillCache,
+  extractSkillSections,
+  pickSkillSection,
+  loadSkillForTask,
   SKILLS_DIR,
 };

@@ -1,10 +1,12 @@
 // src/tasks/taskAnalyzer.js
 // Unified Phase 0: single LLM call replaces promptRefiner + taskParser.
 // Produces a complete task spec with data-driven complexity and volume estimates.
+// Also pre-computes quantities so every downstream stage has hard targets.
 
 const { getSkillCatalog } = require('../skills/loader');
 const { TASK_TYPES } = require('./taskTypes');
 const { parseLlmOutput } = require('../utils/llmParse');
+const { resolveQuantity } = require('./quantityResolver');
 const logger = require('../utils/logger');
 
 function buildAnalyzerPrompt(rawMessage) {
@@ -150,6 +152,18 @@ async function analyzeTask(rawMessage, llmClient) {
       `Analyzed: type=${taskType} complexity=${complexity} steps=${estimatedChunks} (${raw.length} → ${refinedPrompt.length} chars)`,
     );
 
+    const resolvedVolume = {
+      estimatedRows: volume.estimated_rows || null,
+      estimatedPages: volume.estimated_pages || null,
+      estimatedSections: volume.estimated_sections || null,
+      estimatedWords: volume.estimated_words || null,
+      sheets: Array.isArray(volume.sheets) ? volume.sheets : null,
+      sections: Array.isArray(volume.sections) ? volume.sections : null,
+    };
+
+    // Pre-compute hard quantity targets so all downstream stages share the same numbers
+    const quantities = resolveQuantity(taskType, raw, resolvedVolume);
+
     return {
       type: taskType,
       label: taskDef.label,
@@ -162,14 +176,8 @@ async function analyzeTask(rawMessage, llmClient) {
       refinedMessage: refinedPrompt,
       requirements,
       dataDescription: String(data.data_description || refinedPrompt).trim(),
-      volume: {
-        estimatedRows: volume.estimated_rows || null,
-        estimatedPages: volume.estimated_pages || null,
-        estimatedSections: volume.estimated_sections || null,
-        estimatedWords: volume.estimated_words || null,
-        sheets: Array.isArray(volume.sheets) ? volume.sheets : null,
-        sections: Array.isArray(volume.sections) ? volume.sections : null,
-      },
+      volume: resolvedVolume,
+      quantities,
       stepBudget: {
         min: Math.max(2, parseInt(stepBudget.min_steps) || 2),
         max: Math.min(12, parseInt(stepBudget.max_steps) || 12),
@@ -201,6 +209,14 @@ function detectTaskType(message) {
 function buildFallback(raw) {
   const type = detectTaskType(raw);
   const taskDef = TASK_TYPES[type];
+  const volume = {
+    estimatedRows: null,
+    estimatedPages: null,
+    estimatedSections: null,
+    estimatedWords: null,
+    sheets: null,
+    sections: null,
+  };
   return {
     type,
     label: taskDef.label,
@@ -213,14 +229,8 @@ function buildFallback(raw) {
     refinedMessage: raw,
     requirements: [],
     dataDescription: raw,
-    volume: {
-      estimatedRows: null,
-      estimatedPages: null,
-      estimatedSections: null,
-      estimatedWords: null,
-      sheets: null,
-      sections: null,
-    },
+    volume,
+    quantities: resolveQuantity(type, raw, volume),
     stepBudget: { min: 2, max: 6, rationale: '' },
     estimatedRows: null,
     estimatedPages: null,

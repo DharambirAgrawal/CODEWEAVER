@@ -264,3 +264,47 @@ Use standard docx-js patterns (`ExternalHyperlink`, `InternalHyperlink`, `Bookma
 | Empty section array | Return at least one element |
 
 Validation is handled by CodeWeaver (contract check + Execify execution + DOCX structure checks), not by external `validate.py` scripts.
+
+---
+
+## quantity_patterns
+
+These patterns are injected when a step has a hard word-count target. Follow them exactly.
+
+### Writing to a word target
+
+When a step has `words: N`, write N–N+60 words of real content. Do not stop early.
+
+```javascript
+// WRONG — stops after one paragraph:
+function addIntro() {
+  return [new Paragraph({ children: [new TextRun({ text: 'Brief overview.', size: 24 })] })];
+}
+
+// CORRECT — writes to word target with multiple paragraphs:
+function addIntro() {
+  return [
+    new Paragraph({ children: [new TextRun({ text: 'Paragraph one with detailed content spanning multiple sentences covering the first topic in depth.', size: 24 })] }),
+    new Paragraph({ children: [new TextRun({ text: 'Paragraph two continues the discussion with specific data points, examples, and analysis.', size: 24 })] }),
+    new Paragraph({ children: [new TextRun({ text: 'Paragraph three concludes this section with forward-looking statements and connections to the next topic.', size: 24 })] }),
+  ];
+}
+```
+
+### Structure rule for multi-section docs
+
+Every content step must:
+1. Start with a heading paragraph (`HeadingLevel.HEADING_1` or `HEADING_2`)
+2. Follow with at least 3 body paragraphs
+3. Include realistic text (not `"Lorem ipsum"` or `"Content here"`)
+
+```javascript
+function addSection() {
+  return [
+    new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: 'Section Title', size: 32, bold: true })] }),
+    new Paragraph({ children: [new TextRun({ text: 'First detailed paragraph...', size: 24 })], spacing: { after: 200 } }),
+    new Paragraph({ children: [new TextRun({ text: 'Second detailed paragraph...', size: 24 })], spacing: { after: 200 } }),
+    new Paragraph({ children: [new TextRun({ text: 'Third detailed paragraph...', size: 24 })], spacing: { after: 200 } }),
+  ];
+}
+```

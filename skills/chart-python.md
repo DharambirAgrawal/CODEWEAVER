@@ -211,3 +211,48 @@ Execify checks:
 - `SUCCESS:` message printed to stdout
 
 Generated code must call `plt.savefig('/workspace/<outputFile>', ...)` and `print('SUCCESS: ...')` in the final step.
+
+---
+
+## quantity_patterns
+
+### Plotting exactly N data points
+
+When a step has `points: N`, generate exactly N x-values and N y-values.
+
+```python
+# WRONG — hardcoded small dataset:
+years = [2020, 2021, 2022]
+values = [1.1, 1.3, 1.5]
+
+# CORRECT — generate from a range:
+import numpy as np
+years = list(range(1980, 1980 + N))   # N = data_points from task spec
+# or for year-range tasks:
+years = list(range(start_year, end_year + 1))
+values = [base + i * trend + noise for i, noise in enumerate(np.random.uniform(-0.05, 0.05, len(years)))]
+
+plt.plot(years, values)
+```
+
+### Year-range detection
+
+If the task mentions a year range like "1980 to 2023", derive N from the range:
+
+```python
+start_year, end_year = 1980, 2023
+years = list(range(start_year, end_year + 1))  # 44 data points
+```
+
+### Trend line
+
+For line charts with a trend line, add both series to the plot:
+
+```python
+import numpy as np
+z = np.polyfit(range(len(years)), values, 1)
+trend = np.poly1d(z)(range(len(years)))
+plt.plot(years, values, label='Observed', color='steelblue')
+plt.plot(years, trend, linestyle='--', color='red', label='Trend')
+plt.legend()
+```

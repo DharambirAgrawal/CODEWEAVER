@@ -1,5 +1,12 @@
 // src/orchestrator.js
-// The brain — manages the full plan → generate → execute → verify loop
+// The brain — manages the full plan → generate → execute → verify loop.
+// Implements the deep retry logic from PLAN_DEEP.md:
+//   • quantity injection at every stage
+//   • targeted plan corrections (not full regeneration)
+//   • per-step probes + targeted fix prompts
+//   • output-size validation with step-level retry
+
+'use strict';
 
 const { llmComplete } = require('./llm/client');
 const {
@@ -9,29 +16,46 @@ const {
   buildValidationFixPrompt,
   buildSectionPrompt,
   buildSectionStructurePrompt,
+  buildRefinerPrompt,
+  buildNewPlannerPrompt,
+  buildPlanCorrectionPrompt,
+  buildImportsPrompt,
+  buildStepCodePrompt,
+  buildStepFixPrompt,
+  buildContentExpansionPrompt,
 } = require('./llm/prompts');
 const { analyzeTask } = require('./tasks/taskAnalyzer');
+const { resolveQuantity } = require('./tasks/quantityResolver');
 const { parseLlmOutput } = require('./utils/llmParse');
 const { parseJsonFromLlm } = require('./utils/jsonExtract');
 const execify = require('./execify/client');
 const { validateResult, formatErrorForLLM } = require('./execify/validator');
 const { extractContent } = require('./content/extractor');
 const { buildBlueprint } = require('./content/blueprint');
-const { formatErrorForRetry } = require('./utils/errorClassifier');
+const { formatErrorForRetry, classifyError, buildFixInstruction } = require('./utils/errorClassifier');
 const { checkSectionContract, DEFAULT_DOCX_ALLOWED_CONSTRUCTORS } = require('./utils/contractChecker');
 const { TASK_TYPES, resolveRuntimeTask } = require('./tasks/taskTypes');
+const { loadSkillForTask } = require('./skills/loader');
+const { validatePlanQuantities } = require('./validation/quantityValidator');
+const { runStepProbes, validateRefined } = require('./validation/stepValidator');
+const { validateAssembly } = require('./validation/assemblyValidator');
+const { assembleScript } = require('./pipeline/assembler');
+const { parsePlan: parseMarkdownPlan } = require('./pipeline/planParser');
 const { MAX_RETRIES, DOCX_SECTION_IMPORTS } = require('./config');
 const logger = require('./utils/logger');
 
+const MAX_PLAN_RETRIES   = parseInt(process.env.MAX_PLAN_RETRIES || '3', 10);
+const MAX_STEP_RETRIES   = parseInt(process.env.MAX_RETRIES || '3', 10);
+const MAX_OUTPUT_RETRIES = parseInt(process.env.MAX_OUTPUT_RETRIES || '2', 10);
+
 // ─── JOB STATE ────────────────────────────────────────────────────────────────
-// In-memory job store — replace with Redis for production
 const jobs = new Map();
 
 function createJob(jobId, message) {
   const job = {
     id: jobId,
     message,
-    status: 'pending', // pending | running | done | failed
+    status: 'pending',
     currentStep: 0,
     totalSteps: 0,
     stepName: '',
@@ -41,13 +65,12 @@ function createJob(jobId, message) {
     blueprint: null,
     sessionId: null,
     outputFile: null,
-    outputData: null, // base64 file data
+    outputData: null,
     outputMime: null,
     error: null,
     log: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    // SSE subscribers
     _subscribers: [],
   };
   jobs.set(jobId, job);
@@ -56,7 +79,6 @@ function createJob(jobId, message) {
 
 function updateJob(job, updates) {
   Object.assign(job, updates, { updatedAt: Date.now() });
-  // Notify SSE subscribers
   if (job._subscribers.length > 0) {
     const event = buildProgressEvent(job);
     job._subscribers.forEach(send => {
@@ -67,12 +89,28 @@ function updateJob(job, updates) {
 
 function buildProgressEvent(job) {
   return {
+    jobId: job.id,
     status: job.status,
+    stage: job._currentStage || job.status,
+    pct: job._pct || 0,
     currentStep: job.currentStep,
     totalSteps: job.totalSteps,
     stepName: job.stepName,
-    message: job.log[job.log.length - 1] || '',
+    msg: job.log[job.log.length - 1] || '',
+    ts: Date.now(),
   };
+}
+
+function emitProgress(job, { stage, pct, msg, detail }) {
+  job._currentStage = stage;
+  job._pct = pct;
+  addLog(job, msg);
+  if (job._subscribers.length > 0) {
+    const event = { ...buildProgressEvent(job), stage, pct, msg, detail: detail || null, ts: Date.now() };
+    job._subscribers.forEach(send => {
+      try { send(event); } catch {}
+    });
+  }
 }
 
 function getJob(jobId) {
@@ -98,27 +136,50 @@ async function runJob(jobId) {
   if (!job) throw new Error(`Job ${jobId} not found`);
 
   updateJob(job, { status: 'running' });
-  addLog(job, 'Starting job...');
+  const jlog = logger.createJobLogger(jobId, process.env.CW_OUTPUT_DIR || 'tests/output');
 
   try {
-    // ── PHASE 0+1: Unified task analysis (replaces separate refine + parse) ──
-    addLog(job, 'Analyzing your request...');
+    emitProgress(job, { stage: 'analyzing', pct: 5, msg: 'Analyzing your request…' });
+
     const parsedTask = await analyzeTask(job.message, { complete: llmComplete });
     const execRuntime = execify.isMock === true ? 'test' : 'production';
     const task = resolveRuntimeTask(parsedTask, execRuntime);
     updateJob(job, { task });
     addLog(job, `Task type: ${task.label} | Complexity: ${task.complexity}`);
 
+    // ── Quantity resolution ────────────────────────────────────────────────
+    emitProgress(job, { stage: 'quantities', pct: 10, msg: 'Calculating targets (pages, rows, data points)…' });
+    const quantities = resolveQuantity(task.type, job.message, task.volume || {});
+    jlog.quantities(quantities);
+
+    // ── Skill loading ──────────────────────────────────────────────────────
+    const skillData = loadSkillForTask(task.type, task.language, task.preferredLibrary);
+
+    // Build a shared context object that flows through the pipeline
+    const context = {
+      raw_prompt: job.message,
+      task_type: task.type,
+      output_filename: task.outputFile,
+      runtime: task.language,
+      quantities,
+      refined_text: null,
+      skill_raw: skillData?.skill_raw || '',
+      skill_sections: skillData?.skill_sections || {},
+      plan_raw: null,
+      plan: null,
+      generated: { imports_code: '', functions: {}, defined_names: [], full_script: '' },
+      output_path: `/workspace/${task.outputFile}`,
+      execution_log: '',
+      output_stats: null,
+    };
+
     if (task.type === 'word') {
-      await runWordJobV2({ job, task, jobId });
+      await runWordJobV2({ job, task, jobId, context, jlog });
     } else {
-      await runPlannedJob({ job, task, jobId });
+      await runPlannedJob({ job, task, jobId, context, jlog });
     }
 
-    // ── PHASE 5: Cleanup & complete ──────────────────────────────────────────
-    try {
-      await execify.deleteSession(job.sessionId);
-    } catch {}
+    try { await execify.deleteSession(job.sessionId); } catch {}
 
     updateJob(job, { status: 'done' });
     addLog(job, 'Done! Your file is ready to download.');
@@ -128,52 +189,138 @@ async function runJob(jobId) {
     logger.error('Orchestrator', `Job ${jobId} failed`, err.message);
     updateJob(job, { status: 'failed', error: err.message });
     addLog(job, `Failed: ${err.message}`);
-
-    // Cleanup session on failure
     if (job.sessionId) {
       try { await execify.deleteSession(job.sessionId); } catch {}
     }
   }
 }
 
-// ─── NON-WORD TASK FLOW (PLANNED) ───────────────────────────────────────────
-async function runPlannedJob({ job, task, jobId }) {
-  // ── PHASE 2: Plan (YAML output — lighter tokens, more reliable) ──────────
-  addLog(job, 'Planning the code structure...');
-  const planPrompt = buildPlannerPrompt(task);
-  const planRaw = await llmComplete(planPrompt, {
-    maxTokens: 3500,
-    temperature: 0.15,
-  });
-  const plan = parsePlan(planRaw, task);
+// ─── NON-WORD TASK FLOW (PLANNED PIPELINE) ────────────────────────────────────
+async function runPlannedJob({ job, task, jobId, context, jlog }) {
+  // ── Stage: Refine prompt ───────────────────────────────────────────────────
+  emitProgress(job, { stage: 'refined', pct: 15, msg: 'Refining prompt…' });
+  context.refined_text = await refineWithRetry(context, jlog);
+  jlog.refined(context.refined_text);
+  addLog(job, `Prompt refined (${context.refined_text.split(' ').length} words)`);
 
-  updateJob(job, { plan, totalSteps: plan.steps.length });
-  addLog(job, `Plan ready: ${plan.steps.length} steps — ${plan.steps.map(s => s.name).join(' → ')}`);
+  // ── Stage: Plan ────────────────────────────────────────────────────────────
+  emitProgress(job, { stage: 'planning', pct: 25, msg: 'Building plan…' });
+  await buildPlanWithRetry(context, job, jlog);
+  jlog.plan_accepted(context.plan);
 
-  // ── PHASE 3: Create Execify session ─────────────────────────────────────
-  addLog(job, 'Setting up execution environment...');
+  // If the plan structure is not available (no fnParsed steps), fall back to legacy planned flow
+  const hasNewPlan = context.plan?.steps?.some(s => s.fnParsed);
+  if (!hasNewPlan) {
+    return runLegacyPlannedJob({ job, task, jobId });
+  }
+
+  // ── Stage: Setup Execify session ──────────────────────────────────────────
+  emitProgress(job, { stage: 'setup', pct: 30, msg: 'Setting up execution environment…' });
   const session = await execify.createSession();
   updateJob(job, { sessionId: session.session_id });
-  logger.info('Orchestrator', `Session created: ${session.session_id}`);
 
-  // ── PHASE 4: Chunked code generation + execution ─────────────────────────
+  // ── Stage: Generate imports ───────────────────────────────────────────────
+  emitProgress(job, { stage: 'codegen_imports', pct: 32, msg: 'Generating imports…' });
+  const importsCode = await generateImportsWithRetry(context, jlog);
+  context.generated.imports_code = importsCode;
+
+  // ── Stage: Generate each step ─────────────────────────────────────────────
+  const steps = context.plan.steps.filter(s => s.fnParsed?.name);
+  updateJob(job, { totalSteps: steps.length });
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const pct = 32 + Math.floor((i / steps.length) * 38);
+    emitProgress(job, { stage: 'codegen_step', pct, msg: `Writing: ${step.title}…`, detail: step.title });
+    updateJob(job, { currentStep: i + 1, stepName: step.title });
+
+    jlog.step_prompt(step, '');
+    const code = await generateStepWithRetry(step, context, jlog);
+    context.generated.functions[step.title] = code;
+    if (step.fnParsed?.name) context.generated.defined_names.push(step.fnParsed.name);
+    jlog.step_code(step, code);
+  }
+
+  // ── Stage: Assemble ───────────────────────────────────────────────────────
+  emitProgress(job, { stage: 'assembling', pct: 72, msg: 'Assembling script…' });
+  const fullScript = assembleScript(context);
+  const assemblyErrors = validateAssembly(fullScript, context.plan, context.runtime);
+
+  if (assemblyErrors.length > 0) {
+    for (const err of assemblyErrors) {
+      if (err.includes('missing from the assembled script')) {
+        const missingName = err.match(/"([^"]+)"/)?.[1];
+        const missingStep = context.plan.steps.find(s => s.fnParsed?.name === missingName);
+        if (missingStep) {
+          emitProgress(job, { stage: 'assembly_fix', pct: 73, msg: `Re-generating missing function: ${missingName}…` });
+          context.generated.functions[missingStep.title] = await generateStepWithRetry(missingStep, context, jlog);
+        }
+      }
+    }
+  }
+  context.generated.full_script = assembleScript(context);
+  jlog.full_script(context.generated.full_script);
+
+  // ── Stage: Execute ────────────────────────────────────────────────────────
+  emitProgress(job, { stage: 'executing', pct: 78, msg: 'Running script…' });
+  let execResult;
+  try {
+    execResult = await execify.execute({
+      language: task.language,
+      code: context.generated.full_script,
+      sessionId: session.session_id,
+    });
+    jlog.exec_stdout(execResult?.stdout || '');
+  } catch (execErr) {
+    emitProgress(job, { stage: 'exec_error', pct: 79, msg: 'Script crashed, diagnosing…' });
+    jlog.exec_error(execErr.message);
+    const fixed = await fixCrashedScript(execErr.message, context, jlog);
+    context.generated.full_script = fixed;
+    execResult = await execify.execute({
+      language: task.language,
+      code: context.generated.full_script,
+      sessionId: session.session_id,
+    });
+  }
+
+  const finalValidation = await validateResult(execResult, task, { isLast: true });
+  if (!finalValidation.valid) {
+    throw new Error(`Output validation failed: ${finalValidation.message}`);
+  }
+
+  updateJob(job, {
+    outputFile: finalValidation.file?.name || task.outputFile,
+    outputData: finalValidation.file?.data,
+    outputMime: getMimeType(task.type),
+  });
+  emitProgress(job, { stage: 'done', pct: 100, msg: 'File ready.' });
+  jlog.done(context.output_path);
+}
+
+// ─── LEGACY PLANNED JOB (YAML plan, Execify step execution) ──────────────────
+// Used as fallback when the new MD plan cannot be parsed, or for task types
+// that were working fine before (Excel, chart, CSV in production).
+async function runLegacyPlannedJob({ job, task, jobId }) {
+  addLog(job, 'Planning the code structure (legacy mode)…');
+  const planPrompt = buildPlannerPrompt(task);
+  const planRaw = await llmComplete(planPrompt, { maxTokens: 3500, temperature: 0.15 });
+  const plan = parseLegacyPlan(planRaw, task);
+
+  updateJob(job, { plan, totalSteps: plan.steps.length });
+  addLog(job, `Plan ready: ${plan.steps.length} steps`);
+
+  addLog(job, 'Setting up execution environment…');
+  const session = await execify.createSession();
+  updateJob(job, { sessionId: session.session_id });
+
   const verifiedFunctions = [];
 
   for (let i = 0; i < plan.steps.length; i++) {
     const step = { ...plan.steps[i], isLast: i === plan.steps.length - 1 };
-
     updateJob(job, { currentStep: i + 1, stepName: step.name });
     addLog(job, `Step ${i + 1}/${plan.steps.length}: ${step.description}`);
-    logger.step(jobId, i + 1, plan.steps.length, step.name, 'starting');
 
-    const result = await executeStep({
-      job,
-      task,
-      plan,
-      step,
-      verifiedFunctions,
-      sessionId: session.session_id,
-    });
+    const result = await executeStep({ job, task, plan, step, verifiedFunctions, sessionId: session.session_id });
 
     if (!result.success) {
       throw new Error(`Step "${step.name}" failed after ${MAX_RETRIES} attempts: ${result.error}`);
@@ -187,9 +334,6 @@ async function runPlannedJob({ job, task, jobId }) {
       description: step.description,
     });
 
-    logger.step(jobId, i + 1, plan.steps.length, step.name, 'done ✓');
-
-    // If last step — capture the output file
     if (step.isLast && result.outputFile) {
       updateJob(job, {
         outputFile: result.outputFile.name,
@@ -202,8 +346,8 @@ async function runPlannedJob({ job, task, jobId }) {
 }
 
 // ─── WORD TASK FLOW (V2) ────────────────────────────────────────────────────
-async function runWordJobV2({ job, task, jobId }) {
-  addLog(job, 'Extracting document content...');
+async function runWordJobV2({ job, task, jobId, context, jlog }) {
+  emitProgress(job, { stage: 'refined', pct: 15, msg: 'Extracting document content…' });
   const content = await extractContent({
     message: task.refinedMessage || job.message,
     task,
@@ -211,7 +355,7 @@ async function runWordJobV2({ job, task, jobId }) {
   });
   updateJob(job, { content });
 
-  addLog(job, 'Building blueprint...');
+  emitProgress(job, { stage: 'planning', pct: 22, msg: 'Building blueprint…' });
   const blueprint = buildBlueprint(content, {
     outputFile: task.outputFile,
     language: task.language,
@@ -221,7 +365,7 @@ async function runWordJobV2({ job, task, jobId }) {
   updateJob(job, { blueprint, totalSteps: blueprint.sections.length + 1 });
   addLog(job, `Blueprint ready: ${blueprint.sections.length} sections`);
 
-  addLog(job, 'Setting up execution environment...');
+  emitProgress(job, { stage: 'setup', pct: 28, msg: 'Setting up execution environment…' });
   const session = await execify.createSession();
   updateJob(job, { sessionId: session.session_id });
   logger.info('Orchestrator', `Session created: ${session.session_id}`);
@@ -233,36 +377,33 @@ async function runWordJobV2({ job, task, jobId }) {
     const functionName = buildSectionFunctionName(section.id, task.language);
 
     updateJob(job, { currentStep: i + 1, stepName: section.id });
-    addLog(job, `Section ${i + 1}/${blueprint.sections.length}: ${section.type} (${section.id})`);
+    const pct = 30 + Math.floor((i / blueprint.sections.length) * 45);
+    emitProgress(job, {
+      stage: 'codegen_step',
+      pct,
+      msg: `Section ${i + 1}/${blueprint.sections.length}: ${section.type} (${section.id})`,
+      detail: section.id,
+    });
 
     const result = await generateSectionFunction({
-      job,
-      task,
-      section,
-      functionName,
-      sessionId: session.session_id,
-      errorContext: null,
+      job, task, section, functionName, sessionId: session.session_id, errorContext: null,
     });
 
-    sectionFunctions.set(section.id, {
-      functionName,
-      code: result.code,
-    });
+    sectionFunctions.set(section.id, { functionName, code: result.code });
   }
 
-  // Final assembly + execution (deterministic)
   const maxFinalAttempts = Math.min(2, MAX_RETRIES);
   let lastFinalError = null;
 
   for (let attempt = 1; attempt <= maxFinalAttempts; attempt++) {
     updateJob(job, { currentStep: blueprint.sections.length + 1, stepName: 'assemble_and_save' });
-    addLog(job, `Assembling document (attempt ${attempt}/${maxFinalAttempts})...`);
-
-    const assemblyCode = buildAssemblyScript({
-      task,
-      blueprint,
-      sectionFunctions,
+    emitProgress(job, {
+      stage: 'assembling',
+      pct: 78,
+      msg: `Assembling document (attempt ${attempt}/${maxFinalAttempts})…`,
     });
+
+    const assemblyCode = buildAssemblyScript({ task, blueprint, sectionFunctions });
 
     let execResult;
     try {
@@ -284,24 +425,18 @@ async function runWordJobV2({ job, task, jobId }) {
         outputData: validation.file.data,
         outputMime: getMimeType(task.type),
       });
-      addLog(job, `File ready: ${validation.file.name}`);
+      emitProgress(job, { stage: 'done', pct: 100, msg: 'File ready.' });
       return;
     }
 
-    // Structural or runtime failure — retry targeted sections if possible
     if (validation.type === 'validation_error' && validation.details) {
       lastFinalError = validation.message;
       addLog(job, `  Validation failed: ${validation.message}`);
       const retryIds = selectSectionsForRetry(blueprint, validation.details);
       if (retryIds.length === 0) break;
       await regenerateSections({
-        job,
-        task,
-        blueprint,
-        sectionIds: retryIds,
-        sectionFunctions,
-        sessionId: session.session_id,
-        errorContext: validation.message,
+        job, task, blueprint, sectionIds: retryIds,
+        sectionFunctions, sessionId: session.session_id, errorContext: validation.message,
       });
       continue;
     }
@@ -314,24 +449,161 @@ async function runWordJobV2({ job, task, jobId }) {
     const failingId = findFailingSectionId(lastFinalError, sectionFunctions);
     if (failingId) {
       await regenerateSections({
-        job,
-        task,
-        blueprint,
-        sectionIds: [failingId],
-        sectionFunctions,
-        sessionId: session.session_id,
-        errorContext: lastFinalError,
+        job, task, blueprint, sectionIds: [failingId],
+        sectionFunctions, sessionId: session.session_id, errorContext: lastFinalError,
       });
       continue;
     }
-
     break;
   }
 
   throw new Error(`Final assembly failed: ${lastFinalError || 'unknown error'}`);
 }
 
-// ─── EXECUTE A SINGLE STEP WITH RETRY ────────────────────────────────────────
+// ─── REFINER WITH RETRY ──────────────────────────────────────────────────────
+async function refineWithRetry(context, jlog) {
+  let result = context.raw_prompt; // fallback = raw prompt
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    result = await llmComplete(buildRefinerPrompt(context), { maxTokens: 400, temperature: 0.2 });
+    const errors = validateRefined(result);
+    if (errors.length === 0) return result;
+
+    const shortfall = errors.find(e => e.type === 'too_short');
+    if (shortfall && attempt < 2) {
+      context._refiner_extra =
+        `Your previous response was only ${result.split(' ').length} words. ` +
+        'Expand with more specific detail. Minimum 100 words.';
+      if (jlog) jlog.step_retry({ title: 'refiner' }, attempt);
+      continue;
+    }
+    break;
+  }
+  return result;
+}
+
+// ─── PLAN WITH RETRY (targeted corrections) ───────────────────────────────────
+async function buildPlanWithRetry(context, job, jlog) {
+  let planRaw = '';
+
+  for (let attempt = 1; attempt <= MAX_PLAN_RETRIES; attempt++) {
+    if (attempt === 1) {
+      planRaw = await llmComplete(buildNewPlannerPrompt(context), { maxTokens: 2000, temperature: 0.15 });
+    } else {
+      // Targeted correction — do NOT regenerate from scratch
+      const { corrections } = validatePlanQuantities(
+        parseMarkdownPlan(planRaw),
+        context.quantities,
+      );
+      emitProgress(job, {
+        stage: 'plan_retry',
+        pct: 26,
+        msg: `Fixing plan issues (attempt ${attempt})…`,
+      });
+      jlog?.plan_errors?.([corrections]);
+      planRaw = await llmComplete(
+        buildPlanCorrectionPrompt(planRaw, corrections),
+        { maxTokens: 2000, temperature: 0.2 },
+      );
+    }
+
+    if (jlog) jlog.plan_attempt(attempt, planRaw);
+
+    const parsed = parseMarkdownPlan(planRaw);
+    context.plan_raw = planRaw;
+    context.plan = parsed;
+
+    const { valid } = validatePlanQuantities(parsed, context.quantities);
+    if (valid) return;
+
+    if (attempt === MAX_PLAN_RETRIES) {
+      emitProgress(job, { stage: 'plan_warn', pct: 27, msg: 'Plan partially corrected, continuing with best plan…' });
+    }
+  }
+}
+
+// ─── IMPORTS GENERATION WITH RETRY ───────────────────────────────────────────
+async function generateImportsWithRetry(context, jlog) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const code = await llmComplete(buildImportsPrompt(context), { maxTokens: 300, temperature: 0.1 });
+    const clean = code.replace(/^```[^\n]*\n?/m, '').replace(/```\s*$/m, '').trim();
+    // Basic validation: must contain at least one import line
+    const hasImports = /^(import|from|const|require)/m.test(clean);
+    if (hasImports) return clean;
+    if (jlog) jlog.step_retry({ title: 'imports' }, attempt);
+  }
+  // Return a safe minimal fallback
+  return context.runtime === 'node'
+    ? "const fs = require('fs');\nconst path = require('path');"
+    : 'import os\nimport pathlib';
+}
+
+// ─── PER-STEP GENERATOR WITH FULL VALIDATION + RETRY ─────────────────────────
+async function generateStepWithRetry(step, context, jlog, overridePrompt = null) {
+  let prompt = overridePrompt || buildStepCodePrompt(step, context);
+  let code = '';
+
+  for (let attempt = 1; attempt <= MAX_STEP_RETRIES; attempt++) {
+    if (jlog) jlog.step_retry(step, attempt);
+
+    code = await llmComplete(prompt, { maxTokens: 4096, temperature: attempt === 1 ? 0.2 : 0.35 });
+    code = code.replace(/^```[^\n]*\n?/m, '').replace(/```\s*$/m, '').trim();
+
+    const probeResult = await runStepProbes(code, step, context.runtime);
+    if (probeResult.valid) return code;
+
+    if (jlog) jlog.step_error(step, probeResult.error_message);
+
+    if (attempt === MAX_STEP_RETRIES) return code; // Accept last attempt
+
+    // Build a targeted fix prompt based on the exact probe error
+    prompt = buildStepFixPrompt(step, code, probeResult, context);
+  }
+
+  return code;
+}
+
+// ─── CRASH DIAGNOSIS + FIX ────────────────────────────────────────────────────
+async function fixCrashedScript(errorText, context, jlog) {
+  const cls = classifyError(errorText, { language: context.runtime });
+
+  if (!cls || !cls.fixable) return context.generated.full_script;
+
+  if (cls.scope === 'imports') {
+    // Re-run imports codegen with note about missing package
+    const pkg = errorText.match(/No module named '([^']+)'/)?.[1] || '';
+    const hint = pkg ? `\nAdd "${pkg}" to the import list.` : '';
+    context._imports_hint = hint;
+    const newImports = await generateImportsWithRetry(context, jlog);
+    context.generated.imports_code = newImports;
+    return assembleScript(context);
+  }
+
+  if (cls.scope === 'step' || cls.scope === 'save_step') {
+    // Try to find which step owns this error
+    const nameMatch = errorText.match(/'([A-Za-z_][A-Za-z0-9_]*)' is not defined/);
+    if (nameMatch) {
+      const missing = nameMatch[1];
+      const ownerStep = context.plan?.steps?.find(s =>
+        s.fnParsed?.outputs?.includes(missing) || s.fnParsed?.name === missing,
+      );
+      if (ownerStep) {
+        const fixPrompt = buildStepFixPrompt(
+          ownerStep,
+          context.generated.functions[ownerStep.title] || '',
+          { error_type: 'NameError', error_message: errorText },
+          context,
+        );
+        const fixed = await llmComplete(fixPrompt, { maxTokens: 2048, temperature: 0.3 });
+        context.generated.functions[ownerStep.title] = fixed.replace(/^```[^\n]*\n?/m, '').replace(/```\s*$/m, '').trim();
+        return assembleScript(context);
+      }
+    }
+  }
+
+  return context.generated.full_script;
+}
+
+// ─── EXECUTE A SINGLE STEP WITH RETRY (legacy) ────────────────────────────────
 async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId }) {
   let lastError = null;
   let useValidationFix = false;
@@ -344,11 +616,9 @@ async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId
         ? buildValidationFixPrompt(task, plan, step, verifiedFunctions, lastValidationResult)
         : buildRetryPrompt(task, plan, step, verifiedFunctions, lastError, attempt);
 
-    // Generate code
     addLog(job, attempt > 1
-      ? `  Retry ${attempt}/${MAX_RETRIES} for step "${step.name}"...`
-      : `  Generating code for "${step.name}"...`
-    );
+      ? `  Retry ${attempt}/${MAX_RETRIES} for step "${step.name}"…`
+      : `  Generating code for "${step.name}"…`);
 
     let code;
     try {
@@ -360,8 +630,7 @@ async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId
       continue;
     }
 
-    // Execute on Execify
-    addLog(job, `  Executing step "${step.name}"...`);
+    addLog(job, `  Executing step "${step.name}"…`);
     let execResult;
     try {
       execResult = await execify.execute({ language: task.language, code, sessionId });
@@ -374,15 +643,10 @@ async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId
       continue;
     }
 
-    // Validate result
     const validation = await validateResult(execResult, task, step);
 
     if (validation.valid) {
-      return {
-        success: true,
-        code,
-        outputFile: validation.file || null,
-      };
+      return { success: true, code, outputFile: validation.file || null };
     }
 
     if (validation.type === 'validation_error') {
@@ -400,7 +664,6 @@ async function executeStep({ job, task, plan, step, verifiedFunctions, sessionId
       addLog(job, `  Error: ${execResult.stderr?.split('\n').slice(-2).join(' ') || 'execution failed'}`);
     }
 
-    // Non-retryable error — break early
     if (!validation.retryable) {
       logger.warn('Orchestrator', `Non-retryable error in step "${step.name}": ${lastError}`);
       break;
@@ -445,9 +708,8 @@ async function generateSectionFunction({ job, task, section, functionName, sessi
     const prompt = `${basePrompt}${errorNote}`;
 
     addLog(job, attempt > 1
-      ? `  Retry ${attempt}/${MAX_RETRIES} for section "${section.id}"...`
-      : `  Generating section "${section.id}"...`
-    );
+      ? `  Retry ${attempt}/${MAX_RETRIES} for section "${section.id}"…`
+      : `  Generating section "${section.id}"…`);
 
     let code;
     try {
@@ -470,13 +732,7 @@ async function generateSectionFunction({ job, task, section, functionName, sessi
       continue;
     }
 
-    const runtimeCheck = await runSectionCheck({
-      task,
-      code,
-      functionName,
-      sessionId,
-    });
-
+    const runtimeCheck = await runSectionCheck({ task, code, functionName, sessionId });
     if (!runtimeCheck.success) {
       lastError = runtimeCheck.error;
       continue;
@@ -491,7 +747,6 @@ async function generateSectionFunction({ job, task, section, functionName, sessi
 async function verifySectionStructure(section, task) {
   if (!section || (section.type !== 'table' && section.type !== 'nested_list')) return null;
   const prompt = buildSectionStructurePrompt(section);
-
   try {
     const raw = await llmComplete(prompt, { maxTokens: 200, jsonObject: true, temperature: 0.1 });
     const parsed = parseJsonFromLlm(raw);
@@ -502,9 +757,7 @@ async function verifySectionStructure(section, task) {
         hasNesting: Boolean(parsed.value.hasNesting),
       };
     }
-  } catch {
-    // Fall through to local inference
-  }
+  } catch {}
 
   if (section.type === 'table') {
     const headerCount = Array.isArray(section.headers) ? section.headers.length : 0;
@@ -519,24 +772,17 @@ async function verifySectionStructure(section, task) {
     const size = Array.isArray(item?.items) ? item.items.length : 0;
     return Math.max(max, size);
   }, 0);
-
   return { rows: items.length, cols: maxCols, hasNesting };
 }
 
 async function runSectionCheck({ task, code, functionName, sessionId }) {
-  const checkScript = buildSectionCheckScript({
-    language: task.language,
-    code,
-    functionName,
-  });
+  const checkScript = task.language === 'python'
+    ? `from docx import Document\n\n${code}\n\n_document = Document()\n_result = ${functionName}(_document)\nif not isinstance(_result, list):\n    raise Exception("${functionName}() must return a list")\nif len(_result) == 0:\n    raise Exception("${functionName}() returned an empty list")\n`
+    : `const { ${DOCX_SECTION_IMPORTS.join(', ')} } = require('docx');\n\n${code}\n\nconst result = ${functionName}();\nif (!Array.isArray(result)) { throw new Error('${functionName}() must return an array'); }\nif (result.length === 0) { throw new Error('${functionName}() returned an empty array'); }\n`;
 
   let execResult;
   try {
-    execResult = await execify.execute({
-      language: task.language,
-      code: checkScript,
-      sessionId,
-    });
+    execResult = await execify.execute({ language: task.language, code: checkScript, sessionId });
   } catch (err) {
     return {
       success: false,
@@ -560,19 +806,10 @@ async function runSectionCheck({ task, code, functionName, sessionId }) {
   return { success: true };
 }
 
-function buildSectionCheckScript({ language, code, functionName }) {
-  if (language === 'python') {
-    return `from docx import Document\n\n${code}\n\n_document = Document()\n_result = ${functionName}(_document)\nif not isinstance(_result, list):\n    raise Exception("${functionName}() must return a list")\nif len(_result) == 0:\n    raise Exception("${functionName}() returned an empty list")\n`;
-  }
-
-  return `const { ${DOCX_SECTION_IMPORTS.join(', ')} } = require('docx');\n\n${code}\n\nconst result = ${functionName}();\nif (!Array.isArray(result)) { throw new Error('${functionName}() must return an array'); }\nif (result.length === 0) { throw new Error('${functionName}() returned an empty array'); }\n`;
-}
-
 function buildAssemblyScript({ task, blueprint, sectionFunctions }) {
-  const ordered = blueprint.sections.map(section => ({
-    ...section,
-    fn: sectionFunctions.get(section.id),
-  })).filter(section => section.fn);
+  const ordered = blueprint.sections
+    .map(section => ({ ...section, fn: sectionFunctions.get(section.id) }))
+    .filter(section => section.fn);
 
   const functionsCode = ordered.map(section => section.fn.code).join('\n\n');
 
@@ -582,7 +819,6 @@ function buildAssemblyScript({ task, blueprint, sectionFunctions }) {
   }
 
   const callLines = ordered.map(section => `  allSections.push(...${section.fn.functionName}());`).join('\n');
-
   return `const { Document, Packer, ${DOCX_SECTION_IMPORTS.filter(name => name !== 'Document').join(', ')} } = require('docx');\nconst fs = require('fs');\n\n${functionsCode}\n\nasync function main() {\n  const allSections = [];\n${callLines}\n\n  const doc = new Document({ sections: [{ children: allSections }] });\n  const buffer = await Packer.toBuffer(doc);\n  fs.writeFileSync("/workspace/${task.outputFile}", buffer);\n  console.log("SUCCESS: saved /workspace/${task.outputFile}");\n}\n\nmain().catch(err => { console.error(err); process.exit(1); });\n`;
 }
 
@@ -594,7 +830,7 @@ function selectSectionsForRetry(blueprint, details) {
     details.missingHeadings.forEach(missing => {
       const match = sections.find(sec =>
         (sec.type === 'heading1' || sec.type === 'heading2') &&
-        String(sec.text || '').toLowerCase() === String(missing || '').toLowerCase()
+        String(sec.text || '').toLowerCase() === String(missing || '').toLowerCase(),
       );
       if (match) selected.add(match.id);
     });
@@ -623,14 +859,7 @@ async function regenerateSections({ job, task, blueprint, sectionIds, sectionFun
     const section = (blueprint.sections || []).find(sec => sec.id === sectionId);
     if (!section) continue;
     const functionName = buildSectionFunctionName(section.id, task.language);
-    const result = await generateSectionFunction({
-      job,
-      task,
-      section,
-      functionName,
-      sessionId,
-      errorContext,
-    });
+    const result = await generateSectionFunction({ job, task, section, functionName, sessionId, errorContext });
     sectionFunctions.set(section.id, { functionName, code: result.code });
   }
 }
@@ -643,31 +872,10 @@ function findFailingSectionId(errorText, sectionFunctions) {
   return null;
 }
 
-function normalizePlanStep(step) {
-  return {
-    step: step.step,
-    name: step.name,
-    functionName: step.function_name || step.functionName,
-    description: step.description,
-    contentSpec: step.content_spec || step.contentSpec || null,
-    returns: step.returns || 'unknown',
-    linesBudget: step.lines_budget || step.linesBudget || 120,
-    dependsOn: step.depends_on || step.dependsOn || [],
-    // Preserve original fields for codegen prompt
-    function_name: step.function_name || step.functionName,
-    content_spec: step.content_spec || step.contentSpec || null,
-    lines_budget: step.lines_budget || step.linesBudget || 120,
-    depends_on: step.depends_on || step.dependsOn || [],
-  };
-}
-
-function parsePlan(raw, task) {
-  // Try YAML first (new format), then JSON (legacy)
+function parseLegacyPlan(raw, task) {
   const parsed = parseLlmOutput(raw);
-
   if (parsed.ok) {
     const data = parsed.value;
-    // Handle nested plan: { plan: { steps: [...] } } or flat { steps: [...] }
     const planData = data.plan || data;
     const steps = planData.steps;
     if (Array.isArray(steps) && steps.length > 0) {
@@ -680,16 +888,12 @@ function parsePlan(raw, task) {
     }
   }
 
-  // JSON fallback
   const jsonResult = parseJsonFromLlm(raw);
   if (jsonResult.ok && jsonResult.value?.steps && Array.isArray(jsonResult.value.steps)) {
-    return {
-      ...jsonResult.value,
-      steps: jsonResult.value.steps.map(normalizePlanStep),
-    };
+    return { ...jsonResult.value, steps: jsonResult.value.steps.map(normalizePlanStep) };
   }
 
-  logger.warn('Orchestrator', `Failed to parse plan (${parsed.error || 'no steps'}), using fallback`);
+  logger.warn('Orchestrator', `Failed to parse plan, using fallback`);
   return {
     language: task.language,
     library: task.preferredLibrary,
@@ -717,11 +921,26 @@ function parsePlan(raw, task) {
   };
 }
 
+function normalizePlanStep(step) {
+  return {
+    step: step.step,
+    name: step.name,
+    functionName: step.function_name || step.functionName,
+    description: step.description,
+    contentSpec: step.content_spec || step.contentSpec || null,
+    returns: step.returns || 'unknown',
+    linesBudget: step.lines_budget || step.linesBudget || 120,
+    dependsOn: step.depends_on || step.dependsOn || [],
+    function_name: step.function_name || step.functionName,
+    content_spec: step.content_spec || step.contentSpec || null,
+    lines_budget: step.lines_budget || step.linesBudget || 120,
+    depends_on: step.depends_on || step.dependsOn || [],
+  };
+}
+
 function cleanCode(raw) {
   let code = raw.trim();
-  // Strip opening fence with any language tag
   code = code.replace(/^```\w*\s*\n?/, '');
-  // Strip closing fence
   code = code.replace(/\n?```\s*$/, '');
   return code.trim();
 }
