@@ -36,6 +36,18 @@ function parseFnSignature(fnStr) {
 /**
  * Parse a single step block (lines after a ## step_N heading).
  */
+function parseTableField(val) {
+  if (!val) return null;
+  const columnsMatch = val.match(/columns\s*=\s*\[([^\]]*)\]/i);
+  const rowsMatch = val.match(/rows\s*=\s*(\d+)/i);
+  if (!columnsMatch && !rowsMatch) return val;
+  const columns = columnsMatch
+    ? columnsMatch[1].split(',').map(c => c.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+    : [];
+  const rows = rowsMatch ? parseInt(rowsMatch[1], 10) : null;
+  return { columns, rows };
+}
+
 function parseStepBlock(title, lines) {
   const step = {
     title,
@@ -45,6 +57,11 @@ function parseStepBlock(title, lines) {
     words: null,
     rows: null,
     points: null,
+    heading: null,
+    page_break: null,
+    paragraphs: null,
+    table: null,
+    returns: null,
   };
 
   for (const line of lines) {
@@ -67,6 +84,18 @@ function parseStepBlock(title, lines) {
     } else if (key === 'points') {
       const n = parseInt(val, 10);
       if (!isNaN(n)) step.points = n;
+    } else if (key === 'heading') {
+      const n = parseInt(val, 10);
+      if (!isNaN(n)) step.heading = n;
+    } else if (key === 'page_break' || key === 'pagebreak') {
+      step.page_break = /^(true|yes|1)$/i.test(val);
+    } else if (key === 'paragraphs') {
+      const n = parseInt(val, 10);
+      if (!isNaN(n)) step.paragraphs = n;
+    } else if (key === 'table') {
+      step.table = parseTableField(val);
+    } else if (key === 'returns') {
+      step.returns = val;
     }
   }
 

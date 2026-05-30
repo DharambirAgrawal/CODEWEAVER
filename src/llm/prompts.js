@@ -121,27 +121,116 @@ Return only the paragraph. No preamble, no headers, no bullet points.`;
 
 // ── 2.2 Planner prompt (Markdown plan with quantity targets) ──────────────────
 function buildNewPlannerPrompt(context) {
-  const { refined_text, quantities, skill_sections, task_type, runtime } = context;
+  const { refined_text, quantities, skill_sections, task_type, runtime, requirements } = context;
   const lang = runtime === 'node' ? 'JavaScript' : 'Python';
   const qBlock = buildQuantityBlock(quantities || {}, task_type || 'word');
   const skillOverview = skill_sections?.overview || skill_sections?.codeweaver_execution_model || '';
+  const skillPlanning = skill_sections?.planning || '';
   const skillImports = skill_sections?.imports || skill_sections?.dependencies || '';
+  const isNodeWord = task_type === 'word' && runtime === 'node';
+  const isChart = task_type === 'chart';
+  const reqBlock = Array.isArray(requirements) && requirements.length
+    ? requirements.map(r => `- ${r}`).join('\n')
+    : '';
+
+  const chartRules = isChart
+    ? `
+## Chart Python (matplotlib) — execution model
+- Use 3–5 steps total, NOT one step per plot call. Over-splitting breaks matplotlib state.
+- Recommended structure:
+  step_1: setup() → config  (figsize 16:9, dpi 150, style, date range, event dates)
+  step_2: generate_data() → data  (ALL data: historical 180 rows + forecast 30 rows + confidence band in ONE function)
+  step_3: build_chart() → None  (create fig/ax, plot lines, confidence fill, annotations, legend, labels — ONE function)
+  step_4: save_chart() → str  (savefig to OUTPUT_PATH, plt.close(), print SUCCESS)
+- fn signatures use Python types: setup() → config, generate_data() → data, build_chart() → None, save_chart() → filepath
+- returns: dict | DataFrame | None | str — NEVER "array of docx block elements"
+- points: N on the data-generation step (exact data point count)
+- Plot functions mutate pyplot state — they return None, not arrays`
+    : '';
+
+  const wordNodeRules = isNodeWord
+    ? `
+## Word Node (docx v9) — execution model for this plan
+- ## imports = package list ONLY (docx, fs, path). No functions here.
+- step_1 MUST be setup() → config: plain config object with titles, dates, KPI labels, region lists, product names copied from requirements. NO Document, NO Packer, NO docx constructors.
+- step_2+ are section functions. Each returns an array of docx block elements.
+  Signature: buildSectionName() → blocks   (NEVER addX(doc) → doc chaining)
+- Do NOT add finalize/save/assemble/pack steps — the harness builds Document + Packer automatically.
+- Create ONE step per numbered section in the user requirements. Do NOT merge, skip, or combine sections.
+- page_break: true ONLY for major section starts (cover, executive summary, financial highlights, etc.). Tables and subsections within a section share the same page — do NOT force one table per page.
+- Every content step MUST include ALL fields: fn, do, heading, page_break, paragraphs, words, table (if applicable), returns.
+- For tables: copy exact column names and row counts from requirements. column widths must sum to 9360 DXA.
+- For numbered lists use harness reference 'numbered-list'. For bullets use 'bullet-list'. Never unicode bullets.
+- do: must name exact KPIs, column headers, paragraph topics, case-study fields, goal counts — copy from requirements verbatim where given.
+
+Example content step:
+## step_4
+fn: buildKeyMetricsDashboard() → blocks
+do: Heading 2 "Key Metrics Dashboard". Table with exactly 12 KPIs (ARR, NRR, GRR, churn, CAC, LTV, CAC payback, NPS, gross margin, EBITDA margin, headcount, cash runway). Columns KPI, Q2 Value, QoQ Delta. Realistic fictional values.
+heading: 2
+page_break: true
+paragraphs: 0
+words: 420
+table: columns=[KPI, Q2 Value, QoQ Delta] rows=12
+returns: array of docx block elements`
+    : '';
+
+  const wordStepFields = isNodeWord
+    ? `fn: buildSectionName() → blocks
+do: [VERY specific — exact heading text, KPI names, column headers, paragraph topics copied from requirements]
+heading: 1 or 2
+page_break: true or false
+paragraphs: N
+words: N
+table: columns=[Col1, Col2] rows=N   ← omit if no table
+returns: array of docx block elements`
+    : isChart
+      ? `fn: function_name() → return_type
+do: [specific instruction with exact counts, labels, colors, event names]
+points: N   ← on data-generation step only
+returns: dict | DataFrame | None | str`
+      : `fn: function_name(input) → output
+do: [specific instruction — name exact values, ranges, topics]
+${task_type === 'word' ? 'words: N' : ''}
+${task_type === 'excel' || task_type === 'csv' ? 'rows: N' : ''}`;
+
+  const setupStepExample = isNodeWord
+    ? `## step_1
+fn: setup() → config
+do: Shared config: company title, report subtitle, date, confidentiality note, regions [NA, EMEA, APAC, LATAM, ANZ], product names, kpi_labels array with all 12 KPI names from requirements, section_titles array
+heading: 0
+page_break: false
+paragraphs: 0
+words: 0
+returns: config object`
+    : isChart
+      ? `## step_1
+fn: setup() → config
+do: figsize (16,9), dpi 150, seaborn style, start date, historical days=180, forecast days=30, event dates for heatwave/maintenance/policy change
+returns: config dict`
+      : `## step_1
+fn: setup() → config
+do: [shared config keys other steps need]`;
 
   return `SYSTEM:
 You are a code planner. You read a task specification and a skill reference,
 then output a structured Markdown plan. A code generator will execute your plan
 step by step. Every piece of vagueness in your plan becomes a bug in the output.
+Your plan must be so precise that a weak LLM can implement each step WITHOUT seeing the original user prompt.
 
 USER:
 ## Task specification
 ${refined_text}
+${reqBlock ? `\n## Requirements (create one step per section — do not skip any)\n${reqBlock}` : ''}
 
 ## Quantity targets — HARD constraints, not suggestions
 ${qBlock}
 
 ## Skill reference (what functions and patterns are available)
 ${skillOverview}
+${skillPlanning ? `\n### planning\n${skillPlanning}` : ''}
 ${skillImports ? `\n### imports\n${skillImports}` : ''}
+${wordNodeRules}${chartRules}
 
 ## Output format — copy this structure exactly
 
@@ -153,29 +242,22 @@ ${quantities?.total_rows ? `total_rows: ${quantities.total_rows}` : ''}
 ${quantities?.sections ? `sections: ${quantities.sections}` : ''}
 
 ## imports
-[comma-separated package list, all packages needed for the entire script]
+[comma-separated package list only — no code]
 
-## step_1
-fn: function_name() → output_var
-do: [specific instruction — name exact values, ranges, topics]
-${task_type === 'word' ? `words: [N]   ← REQUIRED on every section step` : ''}
-${task_type === 'excel' || task_type === 'csv' ? `rows: [N]    ← REQUIRED on the data-population step` : ''}
+${setupStepExample}
 
 ## step_2
-fn: function_name(input_var) → output_var
-do: [specific instruction]
-${task_type === 'word' ? `words: [N]` : ''}
+${wordStepFields}
 
-[continue for all steps]
+[continue for ALL required sections — one step per section in requirements]
 
 ## Rules you must follow
-1. step_1 is ALWAYS imports only — no fn, no do, just the package list
-2. Every other step is ONE named ${lang} function. One fn per step, no exceptions.
-3. fn: line must show full signature: fn: add_intro(doc) → doc
-4. do: must be SPECIFIC. BAD: "add content about the topic".
-   GOOD: "heading 'The Atmosphere', 3 paragraphs covering CO2 at 96%, surface pressure 600 Pa, temperature -80 to +20°C, dust storms forming in summer"
-5. ${task_type === 'word' ? `words: is REQUIRED on every content step. No content step without a word target.` : `rows: is REQUIRED on the data-population step.`}
-6. ${quantities?.total_words ? `The sum of all words: values must be >= ${quantities.total_words}` : 'Use specific numeric targets in every content step.'}
+1. ## imports is packages only. step_1 is setup/config — NOT imports, NOT Document creation.
+2. Every content step is ONE named ${lang} function. One fn per step, no exceptions.
+3. do: must be SPECIFIC. BAD: "add financial highlights". GOOD: "Heading 2 'Financial Highlights'. Table columns Metric, Q1, Q2, Q3 with rows Revenue, Opex, Gross Profit, Net Income, EBITDA in $M. Then 2 analysis paragraphs on margin trend and opex control."
+4. ${task_type === 'word' ? 'words: is REQUIRED on every content step. Sum of words: must meet total_words target.' : 'rows: is REQUIRED on the data-population step.'}
+5. ${quantities?.total_words ? `The sum of all words: values must be >= ${quantities.total_words}` : 'Use specific numeric targets in every content step.'}
+6. Copy exact counts from requirements (12 KPIs, 5 case studies, 10 goals, etc.) — do not round down or simplify.
 7. Output ONLY the plan block. No explanation before or after.`;
 }
 
@@ -527,15 +609,23 @@ function buildCodeGenPrompt(task, plan, currentStep, verifiedFunctions, lastErro
 
   const wordFormattingBlock = nodeWord && !isSetup
     ? `
-FORMATTING (apply consistently):
-- Title text: size 52 (26pt), bold, centered
-- Section headings: HeadingLevel.HEADING_1, TextRun size 32 (16pt), bold
-- Subsection headings: HeadingLevel.HEADING_2, TextRun size 28 (14pt)
-- Body text: TextRun size 24 (12pt)
-- Paragraph spacing: spacing: { after: 200 } for body; { after: 400 } after section headings
-- Page break: if content_spec.page_break_before is true, start with new Paragraph({ pageBreakBefore: true, children: [] })
-- Tables: width 9360 DXA; columnWidths MUST sum to 9360; cell margins { top: 80, bottom: 80, left: 120, right: 120 }
-- Header row shading: fill D5E8F0, ShadingType.CLEAR; borders BorderStyle.SINGLE color CCCCCC
+HARNESS HELPERS (already injected — use these, do NOT redefine):
+  cwHeading1(text), cwHeading2(text)     — headings with spacing
+  cwPara(text), cwCenter(text, {bold,size}) — body / cover text
+  cwBullet(text), cwNumber(text)         — lists
+  cwTable([['Col1','Col2'], ['a','b']])  — table from 2D string array (first row = header)
+  cwSpacer(200), cwPageBreak(), cwDivider()
+
+CONTENT QUALITY (critical):
+- Each prose paragraph must be 2-4 full sentences with specific facts/numbers — NOT one-liner generics.
+- Write ALL required rows in cwTable data — never pad with empty rows.
+- setup() keys must match usage: if setup returns companyTitle, use setup().companyTitle (not setup().title).
+
+FORMATTING:
+- alignment goes on Paragraph (cwCenter/cwPara), NEVER on TextRun
+- Page break: use cwPageBreak() ONLY when content_spec.page_break_before is true AND this is a major new section (not every table)
+- Cover page: cwCenter() for title/subtitle/date — no page break on cover itself
+- Tables: prefer cwTable(rows) over hand-written TableCell blocks
 `
     : '';
 

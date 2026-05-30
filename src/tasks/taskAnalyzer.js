@@ -10,62 +10,33 @@ const { resolveQuantity } = require('./quantityResolver');
 const logger = require('../utils/logger');
 
 function buildAnalyzerPrompt(rawMessage) {
-  const { skills, taskTypes } = getSkillCatalog();
+  // Keep the prompt compact — the analyzer is sent to smaller/faster models.
+  return `Analyze this file-generation request and return YAML only (no fences, no explanation).
 
-  const skillLines = skills.length
-    ? skills.map(s => `- ${s.id}: ${s.description} (${(s.taskTypes || []).join(', ') || 'any'})`).join('\n')
-    : '(none)';
-
-  const typeLines = taskTypes
-    .map(t => `- ${t.type}: ${t.label} (${(t.extensions || []).join(', ')})`)
-    .join('\n');
-
-  return `You are a task analyzer for an automated file-generation system.
-Analyze the user request and produce a COMPLETE specification.
-
-USER REQUEST:
-"""
-${rawMessage}
+REQUEST: """
+${rawMessage.slice(0, 3000)}
 """
 
-OUTPUT TYPES:
-${typeLines}
-
-SKILLS:
-${skillLines}
-
-Return YAML only. No markdown fences. No explanation.
-
+Return exactly:
 task_type: excel|word|pdf|csv|text|chart
 complexity: low|medium|high
 output_file: filename.ext or null
-refined_prompt: >
-  Detailed actionable spec (3-10 sentences).
-  Structure, data volume, formatting, sections as relevant.
-  Stay faithful — do not add unrelated scope.
+refined_prompt: one-paragraph detailed spec
 requirements:
-  - concrete requirement 1
-  - concrete requirement 2
-data_description: brief description of the data/content
+  - requirement 1
+  - requirement 2
+data_description: brief summary
 volume:
   estimated_rows: null or number
   estimated_pages: null or number
   estimated_sections: null or number
   estimated_words: null or number
-  sheets: null or list of sheet names
-  sections: null or list of section names
+  sheets: null
+  sections: null
 step_budget:
   min_steps: 2
   max_steps: 12
-  rationale: why this many steps
-
-Rules:
-- refined_prompt is the single source of truth downstream
-- volume estimates drive step count and code budgets
-- step_budget.min/max guide the planner (more steps = smaller, testable chunks)
-- For large data (>500 rows, >5 pages): use more steps
-- For simple tasks (1 page, <50 rows): use 2-3 steps
-- requirements must be testable, concrete bullets`;
+  rationale: brief reason`;
 }
 
 function resolveOutputFile(name, taskType) {

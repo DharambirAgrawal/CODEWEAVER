@@ -10,11 +10,13 @@ const YAML = require('yaml');
 const { execSync } = require('child_process');
 const { llmComplete, llmCompleteBestOfN, getProviderChain, providerHasKey } = require('../src/llm/client');
 const { analyzeTask } = require('../src/tasks/taskAnalyzer');
-const { buildPlannerPrompt, buildCodeGenPrompt, buildRetryPrompt, setAvailableLibraries } = require('../src/llm/prompts');
+const { buildPlannerPrompt, buildNewPlannerPrompt, buildCodeGenPrompt, buildRetryPrompt, setAvailableLibraries } = require('../src/llm/prompts');
 const { parseLlmOutput } = require('../src/utils/llmParse');
 const { parseJsonFromLlm } = require('../src/utils/jsonExtract');
 const { TASK_TYPES, resolveRuntimeTask } = require('../src/tasks/taskTypes');
-const { describeSelectedSkills } = require('../src/skills/loader');
+const { describeSelectedSkills, loadSkillForTask } = require('../src/skills/loader');
+const { resolveQuantity } = require('../src/tasks/quantityResolver');
+const { parsePlan: parseMdPlan } = require('../src/pipeline/planParser');
 const {
   buildNodeDocxAssemblyScript,
   getCodegenSteps,
@@ -27,7 +29,10 @@ const logger = require('../src/utils/logger');
 const REPO_ROOT = path.join(__dirname, '..');
 
 const PROMPT_FILE = process.env.CW_PROMPT_FILE || path.join(__dirname, 'prompt.js');
-const OUTPUT_DIR = process.env.CW_OUTPUT_DIR || path.join(__dirname, 'output');
+// Resolve relative CW_OUTPUT_DIR from repo root — probes/scripts run with cwd=OUTPUT_DIR
+const OUTPUT_DIR = process.env.CW_OUTPUT_DIR
+  ? path.resolve(REPO_ROOT, process.env.CW_OUTPUT_DIR)
+  : path.join(__dirname, 'output');
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 const CODE_GEN_MAX_TOKENS = Math.min(
   16384,
@@ -92,10 +97,60 @@ function ensureOutputDir() {
 }
 
 function pickPython() {
-  const venvPython = path.join(__dirname, '..', 'venv', 'bin', 'python');
-  if (process.env.CW_PYTHON) return process.env.CW_PYTHON;
+  const venvPython = path.join(REPO_ROOT, 'venv', 'bin', 'python');
+  const configured = process.env.CW_PYTHON;
+  if (configured) {
+    // Resolve relative paths from repo root — probes run with cwd=OUTPUT_DIR
+    const resolved = path.isAbsolute(configured)
+      ? configured
+      : path.join(REPO_ROOT, configured);
+    if (fs.existsSync(resolved)) return resolved;
+    logger.warn('LocalRunner', `CW_PYTHON not found at ${resolved}, falling back`);
+  }
   if (fs.existsSync(venvPython)) return venvPython;
   return 'python3';
+}
+
+/** Infer return contract from MD plan step + task type (avoid Word defaults on charts). */
+function inferMdStepReturns(s, task, stepIndex) {
+  const outputs = s.fnParsed?.outputs || [];
+  const out = (outputs[0] || '').toLowerCase();
+  const fn = (s.fnParsed?.name || s.fn || '').toLowerCase();
+  const doText = (s.do || '').toLowerCase();
+  const combined = `${fn} ${out} ${doText}`;
+
+  if (task.type === 'chart') {
+    if (stepIndex === 0 || out === 'config' || fn.includes('setup')) {
+      return { type: 'dict', shape: '{ figsize, dpi, style params }' };
+    }
+    if (/save|\.png|write|filepath|output/.test(combined)) {
+      return { type: 'str', shape: 'filepath to saved PNG' };
+    }
+    if (/plot|annotate|draw|legend|axis|style/.test(combined)) {
+      return { type: 'None', shape: 'mutates pyplot axes (no return)' };
+    }
+    if (/data|dataframe|df|series|band|forecast|historical/.test(combined)) {
+      return { type: 'DataFrame', shape: 'pandas DataFrame' };
+    }
+    return { type: 'object', shape: out || 'step result' };
+  }
+
+  if (task.language === 'node' && task.type === 'word') {
+    if (stepIndex === 0 || fn === 'setup') {
+      return { type: 'object', shape: 'config object' };
+    }
+    return { type: 'array', shape: 'array of docx block elements' };
+  }
+
+  if (task.type === 'excel' || task.type === 'csv') {
+    if (stepIndex === 0 || fn.includes('setup')) {
+      return { type: 'dict', shape: 'config object' };
+    }
+    return { type: 'object', shape: out || 'workbook or sheet data' };
+  }
+
+  if (s.returns) return { type: 'object', shape: s.returns };
+  return { type: 'object', shape: out || 'unknown' };
 }
 
 function normalizePlanStep(step) {
@@ -455,6 +510,39 @@ ${code}
   }
 }
 
+function buildPythonProbeImports(task) {
+  const type = task?.type || 'excel';
+  const common = `import sys, os, pathlib
+from datetime import date, datetime, timedelta
+from pathlib import Path
+`;
+  if (type === 'chart') {
+    return `${common}import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+`;
+  }
+  if (type === 'word' || type === 'pdf') {
+    return `${common}from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+`;
+  }
+  if (type === 'csv') {
+    return `${common}import csv
+import json
+`;
+  }
+  return `${common}from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment, Protection
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.utils import get_column_letter
+`;
+}
+
 /**
  * Runtime probe for Python steps via subprocess.
  */
@@ -472,14 +560,7 @@ async function validatePythonRuntime(code, step, task, verifiedFunctions, output
   const normalizedCode = outputPath ? normalizeOutputPaths(code, outputPath) : code;
 
   const probeScript = `
-import sys, os, pathlib
-from datetime import date, datetime, timedelta
-from pathlib import Path
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment, Protection
-from openpyxl.chart import BarChart, LineChart, PieChart, Reference
-from openpyxl.utils import get_column_letter
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ${JSON.stringify(path.basename(outputPath || path.join(OUTPUT_DIR, 'output.xlsx')))} )
+${buildPythonProbeImports(task)}OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ${JSON.stringify(path.basename(outputPath || path.join(OUTPUT_DIR, 'output.xlsx')))} )
 ${priorCode}
 ${normalizedCode}
 try:
@@ -491,10 +572,11 @@ except Exception as e:
 `;
 
   const tmpFile = path.join(OUTPUT_DIR, `_probe_${step.step}.py`);
+  const absTmpFile = path.resolve(tmpFile);
   try {
-    fs.writeFileSync(tmpFile, probeScript);
+    fs.writeFileSync(absTmpFile, probeScript);
     const pythonExe = pickPython();
-    execSync(`${pythonExe} "${tmpFile}"`, {
+    execSync(`"${pythonExe}" "${absTmpFile}"`, {
       stdio: 'pipe',
       timeout: 10000,
       cwd: OUTPUT_DIR,
@@ -504,13 +586,13 @@ except Exception as e:
   } catch (err) {
     const stderr = err.stderr ? err.stderr.toString().trim() : (err.message || String(err));
     const lastLines = stderr.split('\n').slice(-3).join(' ');
-    return `Runtime probe failed for step "${step.name}": ${lastLines} (probe saved: ${tmpFile})`;
+    return `Runtime probe failed for step "${step.name}": ${lastLines} (probe saved: ${absTmpFile})`;
   } finally {
     try {
       if (process.env.CLEAN_PROBE === '0') {
         // Keep probe file for debugging
       } else {
-        fs.unlinkSync(tmpFile);
+        fs.unlinkSync(absTmpFile);
       }
     } catch {}
   }
@@ -671,17 +753,64 @@ async function main() {
   }
 
   console.log('Planning...');
-  const planRaw = await llmComplete(buildPlannerPrompt(task), {
+
+  // Resolve quantities and load skill sections for the planner
+  const quantities = task.quantities || resolveQuantity(task.type, task.refinedMessage || task.rawMessage || '', task.volume || {});
+  const skillData = loadSkillForTask(task.type, task.language, task.preferredLibrary);
+  const skillSections = skillData ? skillData.skill_sections : {};
+
+  const planRaw = await llmComplete(buildNewPlannerPrompt({
+    refined_text: task.refinedMessage || task.rawMessage || '',
+    quantities,
+    skill_sections: skillSections,
+    task_type: task.type,
+    runtime: task.language,
+    requirements: task.requirements || [],
+  }), {
     maxTokens: 3500,
     temperature: 0.15,
   });
 
-  // Save raw plan so user can always inspect what the LLM produced
-  const planSavePath = path.join(OUTPUT_DIR, 'plan.yaml');
+  // Save raw plan — Markdown format
+  const planSavePath = path.join(OUTPUT_DIR, 'plan.md');
   fs.writeFileSync(planSavePath, planRaw);
   console.log(`Plan saved to: ${planSavePath}`);
 
-  const plan = parsePlan(planRaw, task);
+  // Parse the Markdown plan, fall back to old YAML parser if MD parse fails
+  let plan;
+  const mdParsed = parseMdPlan(planRaw);
+  if (mdParsed && mdParsed.steps && mdParsed.steps.length > 0) {
+    // Convert MD plan steps to the shape runPrompt.js expects (with rich content_spec)
+    plan = {
+      language: task.language,
+      library: task.preferredLibrary,
+      outputFile: task.outputFile,
+      steps: mdParsed.steps.map((s, i) => {
+        const fnName = s.fnParsed?.name || (s.fn || '').replace(/\(\).*→.*/, '').trim() || `step${i + 1}`;
+        const contentSpec = {
+          data: s.do || '',
+          ...(s.heading != null ? { heading_level: s.heading } : {}),
+          ...(s.page_break != null ? { page_break_before: s.page_break } : {}),
+          ...(s.paragraphs != null ? { paragraphs: s.paragraphs } : {}),
+          ...(s.table ? { table: s.table } : {}),
+        };
+        return normalizePlanStep({
+          step: i + 1,
+          name: fnName.replace(/^build/i, '').replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '') || fnName,
+          function_name: fnName,
+          description: s.do || '',
+          content_spec: contentSpec,
+          returns: inferMdStepReturns(s, task, i),
+          lines_budget: s.words ? Math.max(40, Math.ceil(s.words / 5)) : 120,
+          depends_on: i === 0 ? [] : [1],
+        });
+      }),
+    };
+    logger.info('LocalRunner', `Parsed MD plan: ${plan.steps.length} steps`);
+  } else {
+    logger.warn('LocalRunner', 'MD plan parse failed, falling back to YAML parser');
+    plan = parsePlan(planRaw, task);
+  }
 
   console.log(`\nPlan: ${plan.steps.length} steps`);
   console.log('─'.repeat(70));
@@ -741,15 +870,16 @@ async function main() {
   finalScript = normalizeOutputPaths(finalScript, outputPath);
 
   const scriptPath = path.join(OUTPUT_DIR, isNode ? 'final_generate.js' : 'final_generate.py');
-  fs.writeFileSync(scriptPath, finalScript);
+  const absScriptPath = path.resolve(scriptPath);
+  fs.writeFileSync(absScriptPath, finalScript);
 
-  console.log(`\nRunning: ${scriptPath}`);
+  console.log(`\nRunning: ${absScriptPath}`);
   if (isNode) {
-    execSync(`node --check "${scriptPath}"`, { stdio: 'inherit', cwd: REPO_ROOT });
-    execSync(`node "${scriptPath}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+    execSync(`node --check "${absScriptPath}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+    execSync(`node "${absScriptPath}"`, { stdio: 'inherit', cwd: REPO_ROOT });
   } else {
     const pythonExe = pickPython();
-    execSync(`${pythonExe} "${scriptPath}"`, {
+    execSync(`"${pythonExe}" "${absScriptPath}"`, {
       stdio: 'inherit',
       cwd: OUTPUT_DIR,
       env: { ...process.env, OUTPUT_PATH: path.basename(outputPath) },

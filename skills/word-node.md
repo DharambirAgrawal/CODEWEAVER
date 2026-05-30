@@ -23,12 +23,19 @@ Reference for CodeWeaver when generating **new** `.docx` files with the `docx` n
 **1. Section functions (Word V2 — most production Node paths)**
 
 - One function per section; orchestrator assembles the final script.
-- Signature: `function renderSectionName() { ... }`
-- **Return** an array of block elements: `return [ new Paragraph(...), new Table(...) ]`
+- Signature: `function buildSectionName() { ... }`
+- **Return** an array of block elements: `return [ cwHeading2('Title'), cwPara('...'), cwTable([...]) ]`
 - **Do not** include `require()`, `import`, `Document()`, `Packer`, or `fs` in section code.
 - **Do not** save files in section functions.
-- Use only constructors from the allowed list: `Paragraph`, `TextRun`, `Table`, `TableRow`, `TableCell` (plus enums like `HeadingLevel`, `AlignmentType`, `BorderStyle`, `WidthType` passed via outer imports).
-- **Do not invent helpers** (e.g. `createHeading`, `newParagraph`, `styledParagraph`). Use `docx` APIs only.
+- **Use harness helpers** injected by the runner — do NOT redefine them:
+  - `cwHeading1(text)`, `cwHeading2(text)` — section headings with spacing
+  - `cwPara(text, opts?)` — body paragraph, justified, Arial 11pt
+  - `cwCenter(text, opts?)` — centered text (cover page titles)
+  - `cwBullet(text, bold?)`, `cwNumber(text)` — lists (uses pre-defined numbering)
+  - `cwTable(rows)` — `rows` is `string[][]`, first row = header
+  - `cwSpacer(after?)`, `cwPageBreak()`, `cwDivider()` — layout
+- Do NOT hand-write full `new TableCell({...})` blocks when `cwTable()` works.
+- Do NOT invent custom helpers with different names — use the `cw*` helpers only.
 
 **2. Final assembly step (or single-shot scripts)**
 
@@ -55,6 +62,27 @@ main().catch(err => { console.error(err); process.exit(1); });
 ```
 
 Replace `output_1234567890.docx` with the actual `task.outputFile` value from the job.
+
+---
+
+## Planning (for the planner LLM)
+
+When writing a Markdown plan for Word Node (section-functions mode), follow these rules exactly:
+
+| Rule | Detail |
+|------|--------|
+| **step_1** | `setup() → config` — plain object with titles, dates, KPI labels, region lists, product names. NO Document, NO docx constructors. |
+| **step_2+** | One function per document section. Signature: `buildSectionName() → blocks`. Returns array of Paragraph/Table elements. |
+| **Never** | `addX(doc) → doc` chaining, `finalizeDocument`, `save`, `assemble`, or `Packer` steps — the harness handles assembly. |
+| **do:** | Must copy exact KPI names, column headers, paragraph counts, and section titles from user requirements. Vague `do:` lines produce bad code. |
+| **table:** | `columns=[A,B,C] rows=N` — copy exact column names and row counts from requirements. |
+| **heading:** | `1` for major sections, `2` for subsections. |
+| **page_break:** | `false` for cover; `true` only for major section starts — NOT before every table (avoid one-table-per-page layout) |
+| **paragraphs:** | Exact count for prose sections (e.g. executive summary: `paragraphs: 6`). |
+| **words:** | Per-section word target; sum must meet `total_words`. |
+| **Lists** | In codegen use `reference: 'numbered-list'` or `'bullet-list'` — never unicode bullets, never invent numbering config. |
+
+Library version: **docx v9** (docx-js). Use `HeadingLevel`, `WidthType.DXA`, half-point font sizes (`size: 24` = 12pt).
 
 ---
 
@@ -145,27 +173,45 @@ Section pattern for multi-section documents:
 
 ## Lists (never use unicode bullets)
 
-```javascript
-// WRONG
-new Paragraph({ children: [new TextRun('• Item')] })
+In **section-functions mode** (Word V2 / most production paths) the Document constructor is built by the harness — do NOT define numbering config yourself. Use the pre-defined harness references only:
 
-// CORRECT — numbering config
+| List type | reference string | notes |
+|-----------|-----------------|-------|
+| Numbered (1. 2. 3.) | `'numbered-list'` | Use this for goal lists, ordered steps |
+| Bullets (• ○) | `'bullet-list'` | Use this for unordered items |
+| Legacy alias | `'numbering'` | Also supported, maps to decimal numbers |
+
+```javascript
+// CORRECT — section function using pre-defined harness references
+function buildGoals() {
+  return [
+    new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun('Q3 Goals')] }),
+    new Paragraph({ numbering: { reference: 'numbered-list', level: 0 }, children: [new TextRun('Reach $5M ARR')] }),
+    new Paragraph({ numbering: { reference: 'numbered-list', level: 0 }, children: [new TextRun('Hire 20 engineers')] }),
+    new Paragraph({ numbering: { reference: 'bullet-list', level: 0 }, children: [new TextRun('Review strategy')] }),
+  ];
+}
+
+// WRONG — never define numbering config in section functions
+// (there is no Document constructor here to put it in)
+const doc = new Document({ numbering: { config: [...] } });  // ← WRONG in section mode
+```
+
+In **single-shot scripts** (one standalone file), you must define the config in the Document constructor:
+
+```javascript
 const doc = new Document({
   numbering: {
     config: [
-      { reference: 'bullets',
-        levels: [{ level: 0, format: LevelFormat.BULLET, text: '•', alignment: AlignmentType.LEFT,
+      { reference: 'numbered-list',
+        levels: [{ level: 0, format: 'decimal', text: '%1.', alignment: AlignmentType.LEFT,
+          style: { paragraph: { indent: { left: 720, hanging: 360 } } } }] },
+      { reference: 'bullet-list',
+        levels: [{ level: 0, format: 'bullet', text: '\u2022', alignment: AlignmentType.LEFT,
           style: { paragraph: { indent: { left: 720, hanging: 360 } } } }] },
     ],
   },
-  sections: [{
-    children: [
-      new Paragraph({
-        numbering: { reference: 'bullets', level: 0 },
-        children: [new TextRun('Bullet item')],
-      }),
-    ],
-  }],
+  sections: [{ children: [...paragraphsWithNumbering] }],
 });
 ```
 

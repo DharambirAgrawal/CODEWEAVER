@@ -84,6 +84,99 @@ function buildNodeDocxAssemblyScript({ plan, stepCodes, outputPath }) {
     return `  await pushBlocks(allSections, ${fn});`;
   }).join('\n');
 
+  const helperBlock = `
+// ─── Harness helpers (use these — do NOT redefine) ─────────────────────────
+const __cwBorder = { style: BorderStyle.SINGLE, size: 1, color: 'BBBBBB' };
+const __cwBorders = { top: __cwBorder, bottom: __cwBorder, left: __cwBorder, right: __cwBorder };
+const __cwContentWidth = 9360;
+
+function cwHeading1(text) {
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_1,
+    spacing: { before: 320, after: 160 },
+    children: [new TextRun({ text, bold: true, size: 32, font: 'Arial' })],
+  });
+}
+
+function cwHeading2(text) {
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_2,
+    spacing: { before: 240, after: 120 },
+    children: [new TextRun({ text, bold: true, size: 28, font: 'Arial' })],
+  });
+}
+
+function cwPara(text, opts = {}) {
+  return new Paragraph({
+    alignment: AlignmentType.JUSTIFIED,
+    spacing: { before: 60, after: 120 },
+    children: [new TextRun({ text, size: 22, font: 'Arial', ...opts })],
+  });
+}
+
+function cwCenter(text, opts = {}) {
+  return new Paragraph({
+    alignment: AlignmentType.CENTER,
+    spacing: { before: 80, after: 80 },
+    children: [new TextRun({ text, size: 22, font: 'Arial', ...opts })],
+  });
+}
+
+function cwBullet(text, bold = false) {
+  return new Paragraph({
+    numbering: { reference: 'bullet-list', level: 0 },
+    spacing: { before: 40, after: 40 },
+    children: [new TextRun({ text, size: 22, font: 'Arial', bold })],
+  });
+}
+
+function cwNumber(text) {
+  return new Paragraph({
+    numbering: { reference: 'numbered-list', level: 0 },
+    spacing: { before: 40, after: 40 },
+    children: [new TextRun({ text, size: 22, font: 'Arial' })],
+  });
+}
+
+function cwSpacer(after = 200) {
+  return new Paragraph({ spacing: { after }, children: [] });
+}
+
+function cwPageBreak() {
+  return new Paragraph({ children: [new PageBreak()] });
+}
+
+function cwDivider() {
+  return new Paragraph({
+    border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: 'AAAAAA' } },
+    spacing: { before: 160, after: 160 },
+    children: [],
+  });
+}
+
+/** rows: string[][] — first row is header */
+function cwTable(rows) {
+  const cols = rows[0].length;
+  const colWidth = Math.floor(__cwContentWidth / cols);
+  const columnWidths = Array(cols).fill(colWidth);
+  return new Table({
+    width: { size: __cwContentWidth, type: WidthType.DXA },
+    columnWidths,
+    rows: rows.map((row, ri) => new TableRow({
+      children: row.map(cell => new TableCell({
+        borders: __cwBorders,
+        width: { size: colWidth, type: WidthType.DXA },
+        shading: ri === 0 ? { fill: 'D0E4F7', type: ShadingType.CLEAR } : undefined,
+        margins: { top: 80, bottom: 80, left: 120, right: 120 },
+        children: [new Paragraph({
+          children: [new TextRun({ text: String(cell), size: 22, font: 'Arial', bold: ri === 0 })],
+        })],
+      })),
+    })),
+  });
+}
+`;
+
   return `${importBlock}
 
 const OUTPUT_PATH = path.join(__dirname, ${JSON.stringify(outputFileName)});
@@ -96,6 +189,7 @@ async function pushBlocks(allSections, fn) {
   }
   allSections.push(...blocks);
 }
+${helperBlock}
 
 ${blocks.map(b => b.body).join('\n\n')}
 
@@ -136,6 +230,77 @@ async function main() {
   const allSections = [];
 ${callLines || '  // no section steps'}
   const doc = new Document({
+    styles: {
+      default: {
+        document: { run: { font: 'Arial', size: 22 } },
+      },
+      paragraphStyles: [
+        {
+          id: 'Heading1', name: 'Heading 1', basedOn: 'Normal', next: 'Normal', quickFormat: true,
+          run: { size: 32, bold: true, font: 'Arial', color: '1F4E79' },
+          paragraph: { spacing: { before: 320, after: 160 }, outlineLevel: 0 },
+        },
+        {
+          id: 'Heading2', name: 'Heading 2', basedOn: 'Normal', next: 'Normal', quickFormat: true,
+          run: { size: 28, bold: true, font: 'Arial', color: '2F5496' },
+          paragraph: { spacing: { before: 240, after: 120 }, outlineLevel: 1 },
+        },
+      ],
+    },
+    numbering: {
+      config: [
+        {
+          reference: 'numbered-list',
+          levels: [
+            {
+              level: 0,
+              format: 'decimal',
+              text: '%1.',
+              alignment: AlignmentType.LEFT,
+              style: { paragraph: { indent: { left: 720, hanging: 360 } } },
+            },
+            {
+              level: 1,
+              format: 'lowerLetter',
+              text: '%2.',
+              alignment: AlignmentType.LEFT,
+              style: { paragraph: { indent: { left: 1440, hanging: 360 } } },
+            },
+          ],
+        },
+        {
+          reference: 'bullet-list',
+          levels: [
+            {
+              level: 0,
+              format: 'bullet',
+              text: '\\u2022',
+              alignment: AlignmentType.LEFT,
+              style: { paragraph: { indent: { left: 720, hanging: 360 } } },
+            },
+            {
+              level: 1,
+              format: 'bullet',
+              text: '\\u25E6',
+              alignment: AlignmentType.LEFT,
+              style: { paragraph: { indent: { left: 1440, hanging: 360 } } },
+            },
+          ],
+        },
+        {
+          reference: 'numbering',
+          levels: [
+            {
+              level: 0,
+              format: 'decimal',
+              text: '%1.',
+              alignment: AlignmentType.LEFT,
+              style: { paragraph: { indent: { left: 720, hanging: 360 } } },
+            },
+          ],
+        },
+      ],
+    },
     sections: [{
       properties: {
         page: {
